@@ -68,6 +68,7 @@ function summarizeAnthropicBody(body) {
     tools: tools.length || undefined,
     tool_names: tools.length ? tools.map((tool) => tool?.name).filter(Boolean).slice(0, 30) : undefined,
     tool_choice: body?.tool_choice,
+    thinking: body?.thinking?.type,
   };
 }
 

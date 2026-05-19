@@ -463,10 +463,34 @@ read/open/file/CLAUDE.md/AGENTS.md -> Read, LS
 grep/search/find                  -> Grep, Glob, Read
 edit/write/fix/implement          -> Read, Edit, MultiEdit, Write, Grep, Glob
 run/test/bash/uv/python/node      -> Bash, Read
+summarize/overview/structure/repo -> Read, Glob, Grep
 ```
 
 For normal chat such as `please only reply OK`, the proxy injects no tool
 prompt.
+
+### Claude Code DeepSeek-Only Mode (2026-05)
+
+The Claude Code proxy is currently optimized for `deepseek-v4-pro` only:
+
+```text
+All client model names map to SZTU_DEFAULT_MODEL (default: deepseek-v4-pro).
+GLM remains available for OpenCode/CodeBuddy/direct tests but is not the CC default.
+```
+
+Reasoning is mapped per Claude Code request:
+
+```text
+thinking.type = enabled  -> chat_template_kwargs.thinking = true
+thinking.type = adaptive -> true
+thinking.type = disabled -> false
+(no thinking field)      -> true
+```
+
+The proxy does not currently forward DeepSeek `reasoning_content` back to Claude
+Code thinking blocks; only final `content` is surfaced to the client.
+
+Reference config: `claudecode/settings.json`.
 
 ### Tool Output Formats Seen in Practice
 
@@ -559,6 +583,37 @@ to execute multiple tool calls from one malformed assistant message.
 <tool_call>Bash<arg_key>command": "git diff"</arg_value></tool_call>
 ```
 
+12. DeepSeek `<tool-use>` XML:
+
+```text
+<tool-use name="Bash"><parameter name="command">ls -la</parameter></tool-use>
+```
+
+13. Repeated `Tool:` prefix with JSON body:
+
+```text
+Tool: Read
+Tool: {"file_path":"README.md"}
+```
+
+14. Claude-style inline tool blocks:
+
+```text
+<tool-calls>
+<tool_use id="...">Read: README.md</tool_use>
+<tool_use id="...">Bash: tree -L 2</tool_use>
+</tool-calls>
+```
+
+15. Truncated quoted Bash commands (repair leading quote, reject unbalanced quotes).
+
+Before returning `tool_use`, the parser drops any input keys that are not listed
+in the Claude Code tool `input_schema.properties`. This prevents errors such as:
+
+```text
+InputValidationError: Glob failed ... unexpected parameter `limit`
+```
+
 All of these are normalized to Anthropic `tool_use`.
 
 The parser is now split into:
@@ -578,7 +633,8 @@ does not copy that project's GPL code. It applies these steps:
 4. Try loose XML, arg_key/arg_value, function-call, and key/value formats.
 5. Repair small JSON defects such as single quotes, trailing commas, unquoted
    keys, and unescaped Windows backslashes.
-6. Enforce the Claude Code tool whitelist and required input fields.
+6. Enforce the Claude Code tool whitelist, required input fields, and
+   `input_schema.properties` allowlist.
 7. Return the first valid candidate; otherwise return diagnostic metadata for
    logging.
 ```
@@ -594,7 +650,9 @@ node .\scripts\test-tool-parser.js
 
 This test includes the `Read / Read: file_path: ...` failure format, escaped
 and unescaped Windows paths, DeepSeek-style tags, JSON arrays, code-fence false
-positives, allowed-tool filtering, and missing required arguments.
+positives, allowed-tool filtering, missing required arguments, `Tool: {json}`,
+`<tool-use>`, `<tool-calls>` inline tools, truncated Bash quotes, and Glob
+schema field filtering.
 
 ### Tool Result History
 
@@ -760,7 +818,8 @@ This makes the common failure modes distinguishable:
 ```text
 listen EADDRINUSE             local port already occupied
 upstream-error-response 502   SZTU/APISIX upstream failure
-tool-parse-hit missing        model answered text instead of a parseable tool call
+tool-parse-miss               model answered text instead of a parseable tool call
+tool-parse-hit + CC error     parsed tool input may include invalid schema fields (should be filtered now)
 bad-upstream-sse              upstream emitted malformed SSE JSON
 ```
 

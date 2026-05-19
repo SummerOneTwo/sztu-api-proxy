@@ -102,7 +102,17 @@ const cases = [
   {
     name: "malformed arg key contains command pair",
     text: `<tool_call>Bash<arg_key>command": "git diff"</arg_value><arg_key>description": "Show working tree changes"</arg_value></tool_call>`,
-    expect: { name: "Bash", input: { command: "git diff", description: "Show working tree changes" } },
+    expect: { name: "Bash", input: { command: "git diff" } },
+  },
+  {
+    name: "truncated bash command unclosed quote",
+    text: 'Bash command: "ls -la c:/userProgram/program/sztu-api-proxy/',
+    expect: { name: "Bash", input: { command: "ls -la c:/userProgram/program/sztu-api-proxy/" } },
+  },
+  {
+    name: "truncated bash json unclosed quote",
+    text: '<tool_call>{"name":"Bash","input":{"command":"\\"ls -la c:/userProgram/program/sztu-api-proxy/"}}</tool_call>',
+    expect: { name: "Bash", input: { command: "ls -la c:/userProgram/program/sztu-api-proxy/" } },
   },
   {
     name: "deepseek tool tags",
@@ -113,6 +123,46 @@ const cases = [
     name: "json array first valid tool",
     text: `<tool_call>[{"name":"Glob","input":{"pattern":"**/*.js"}},{"name":"Read","input":{"file_path":"README.md"}}]</tool_call>`,
     expect: { name: "Glob", input: { pattern: "**/*.js" } },
+  },
+  {
+    name: "deepseek tool-use bash",
+    text: '让我先了解项目结构。 <tool-use name="Bash"> <parameter name="command">ls -la</parameter> </parameter> </tool-use>',
+    expect: { name: "Bash", input: { command: "ls -la" } },
+  },
+  {
+    name: "deepseek tool-use read",
+    text: '<tool-use name="Read"><parameter name="file_path">README.md</parameter></tool-use>',
+    expect: { name: "Read", input: { file_path: "README.md" } },
+  },
+  {
+    name: "deepseek tool colon json one line",
+    text: `Tool: Read Tool: {"file_path": "${winPath.replace(/\\/g, "\\\\")}"}`,
+    expect: { name: "Read", input: { file_path: winPath } },
+  },
+  {
+    name: "deepseek tool colon json multiline",
+    text: `Tool: Read\nTool: {"file_path": "${winPath.replace(/\\/g, "\\\\")}"}`,
+    expect: { name: "Read", input: { file_path: winPath } },
+  },
+  {
+    name: "deepseek tool colon json first of repeated",
+    text: `Tool: Read Tool: {"file_path": "README.md"} Tool: Read Tool: {"file_path": "package.json"}`,
+    expect: { name: "Read", input: { file_path: "README.md" } },
+  },
+  {
+    name: "glob named xml strips unknown limit",
+    text: '<tool_call name="Glob"> {"pattern": "**/*.js", "path": "src", "limit": 50} </tool_call>',
+    expect: { name: "Glob", input: { pattern: "**/*.js", path: "src" } },
+  },
+  {
+    name: "tool-calls inline read",
+    text: '<tool-calls><tool_use id="x">Read: README.md</tool_use></tool-calls>',
+    expect: { name: "Read", input: { file_path: "README.md" } },
+  },
+  {
+    name: "tool-calls inline bash",
+    text: "<tool-calls><tool_use id=\"x\">Bash: tree -L 2</tool_use><tool_use id=\"y\">Read: package.json</tool_use></tool-calls>",
+    expect: { name: "Bash", input: { command: "tree -L 2" } },
   },
 ];
 
@@ -140,6 +190,10 @@ const misses = [
   {
     name: "tool example inside code fence",
     text: "Example:\n```text\n<tool_call>{\"name\":\"Read\",\"input\":{\"file_path\":\"README.md\"}}</tool_call>\n```",
+  },
+  {
+    name: "bash command with unbalanced interior quotes",
+    text: 'Bash command: "git diff "main"',
   },
 ];
 

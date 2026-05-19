@@ -14,9 +14,29 @@ const CLAUDE_DIR = __dirname;
 const RUNTIME_DIR = path.join(CLAUDE_DIR, ".runtime");
 const LOG_PATH = path.join(RUNTIME_DIR, "claudecode-proxy.log");
 const PID_PATH = path.join(RUNTIME_DIR, "claudecode-proxy.pid");
-const DEFAULT_MODEL = process.env.SZTU_DEFAULT_MODEL || "glm-5.1";
+const DEFAULT_MODEL = process.env.SZTU_DEFAULT_MODEL || "deepseek-v4-pro";
 const DEFAULT_MAX_TOKENS = envNumber("SZTU_DEFAULT_MAX_TOKENS", 16384);
 const MAX_TOKENS = envNumber("SZTU_MAX_TOKENS", 32768);
+
+function resolveDeepseekThinking(body) {
+  const config = body?.thinking;
+  if (config && typeof config === "object") {
+    if (config.type === "enabled" || config.type === "adaptive") {
+      return true;
+    }
+    if (config.type === "disabled") {
+      return false;
+    }
+  }
+  return true;
+}
+
+function chatTemplateKwargs(model, thinking) {
+  if (model === "deepseek-v4-pro") {
+    return { thinking };
+  }
+  return { enable_thinking: thinking };
+}
 
 fs.mkdirSync(RUNTIME_DIR, { recursive: true });
 
@@ -77,11 +97,7 @@ function normalizeMaxTokens(value) {
   return Math.min(Math.trunc(n), configuredMax);
 }
 
-function upstreamModel(model) {
-  const raw = typeof model === "string" ? model : "";
-  if (raw.includes("deepseek") || raw.includes("ds") || raw.includes("haiku")) {
-    return "deepseek-v4-pro";
-  }
+function upstreamModel() {
   return DEFAULT_MODEL;
 }
 
@@ -219,8 +235,11 @@ function anthropicToolsToPrompt(tools, messages) {
     .join("\n");
 
   return [
-    "You may use one tool by responding with exactly one XML-like tool call and no other text.",
-    'Format: <tool_call>{"name":"ToolName","input":{...}}</tool_call>',
+    "You may use one tool by responding with exactly one tool call and no other text.",
+    'Preferred format: <tool_call>{"name":"ToolName","input":{...}}</tool_call>',
+    'Alternative format: <tool-use name="ToolName"><parameter name="field">value</parameter></tool-use>',
+    "For exploring a codebase, prefer Read or Glob before Bash.",
+    "Only use parameter names from input_schema. Do not invent fields such as limit.",
     "After a tool result is provided, continue normally or request another tool call.",
     "Available tools:",
     summarized,
@@ -250,6 +269,9 @@ function selectRelevantTools(tools, messages) {
   }
   if (/(bash|shell|run|execute|command|test|npm|uv|python|node|执行|运行|命令|测试)/i.test(text)) {
     add("Bash", "Read");
+  }
+  if (/(总结|概览|项目|结构|目录|overview|summarize|structure|repo|codebase)/i.test(text)) {
+    add("Read", "Glob", "Grep");
   }
 
   if (wanted.size === 0) {
@@ -292,11 +314,7 @@ function buildUpstreamBody(body) {
     upstream.tool_choice = body.tool_choice ? "auto" : "auto";
   }
 
-  if (model === "deepseek-v4-pro") {
-    upstream.chat_template_kwargs = { thinking: false };
-  } else {
-    upstream.chat_template_kwargs = { enable_thinking: false };
-  }
+  upstream.chat_template_kwargs = chatTemplateKwargs(model, resolveDeepseekThinking(body));
 
   if (upstream.stream) {
     upstream.stream_options = { include_usage: true };
@@ -390,7 +408,7 @@ function parseToolWithLog(text, tools, requestId, stream) {
 }
 
 function looksLikeToolText(text) {
-  return typeof text === "string" && /<tool|tool_call|Tool:\s|Arguments:|<\/think>|<\|tool/i.test(text);
+  return typeof text === "string" && /<tool|tool_call|tool-use|tool-calls|<tool_use\b|Tool:\s|Arguments:|<\/think>|<\|tool/i.test(text);
 }
 
 function safeJson(text) {
@@ -664,7 +682,7 @@ const server = http.createServer(async (req, res) => {
   try {
     const pathName = new URL(req.url || "/", `http://${HOST}:${PORT}`).pathname;
     if (req.method === "GET" && pathName === "/health") {
-      writeJson(res, 200, { ok: true, models: ["glm-5.1", "deepseek-v4-pro"] });
+      writeJson(res, 200, { ok: true, primary: DEFAULT_MODEL, models: [DEFAULT_MODEL] });
       return;
     }
     if (req.method !== "POST" || pathName !== "/v1/messages") {
@@ -682,7 +700,7 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, HOST, () => {
   fs.writeFileSync(PID_PATH, String(process.pid), "utf8");
-  log("listening", { host: HOST, port: PORT });
+  log("listening", { host: HOST, port: PORT, model: DEFAULT_MODEL });
 });
 
 function cleanup() {

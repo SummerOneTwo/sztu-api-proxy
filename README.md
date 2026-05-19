@@ -17,12 +17,16 @@ SZTU_API_KEY=your_key_here
 Optional:
 
 ```env
+SZTU_DEFAULT_MODEL=deepseek-v4-pro
 OPENCODE_PROXY_PORT=8788
 CLAUDE_SZTU_PROXY_PORT=8790
 CODEBUDDY_PROXY_PORT=8787
 SZTU_DEFAULT_MAX_TOKENS=16384
 SZTU_MAX_TOKENS=32768
 ```
+
+Claude Code proxy (`claudecode/`) is currently optimized for DeepSeek; see
+`claudecode/README.md`.
 
 ## Proxies
 

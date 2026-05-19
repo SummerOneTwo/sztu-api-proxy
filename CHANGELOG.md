@@ -12,6 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added a structured JSONL logger shared by OpenCode, CodeBuddy, and Claude Code proxies, with request IDs, sanitized request/upstream summaries, durations, upstream error previews, and Claude Code tool parsing diagnostics.
 - Added `claudecode/tool-parser.js`, a dedicated Claude Code tool-call parsing and repair pipeline inspired by `ds-free-api` design ideas without copying GPL code.
 - Added parser-only regression tests in `scripts/test-tool-parser.js` for malformed Claude Code tool-call outputs.
+- Added DeepSeek-focused `claudecode/README.md` and default `settings.json` using `deepseek-v4-pro`.
+- Added tool parser support for DeepSeek `<tool-use><parameter>`, `Tool: Read` + `Tool: {"file_path":...}`, `<tool-calls><tool_use>Read: ...</tool_use>`, and redacted DeepSeek tool tags.
+- Added per-request DeepSeek reasoning mapping from Claude Code `thinking` (`enabled`, `disabled`, `adaptive`; default on when omitted).
+- Added `client.thinking` to Anthropic request summaries in proxy logs.
 
 ### Changed
 
@@ -19,12 +23,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Improved Claude Code streaming `tool_use` output to send tool inputs through Anthropic-style `input_json_delta` events, fixing empty `Bash IN` blocks and missing `command` errors.
 - Expanded Claude Code parser coverage for malformed `<tool_call>` blocks, `</think>` truncation, DeepSeek-style tool tags, JSON arrays, code-fence false positives, Windows paths, and malformed `<arg_key>` key/value pairs.
 - Improved runtime troubleshooting documentation for SZTU upstream 502s, Claude Code tool parsing, and stream tool input handling.
+- Claude Code proxy now routes all client model names to `deepseek-v4-pro` by default (`SZTU_DEFAULT_MODEL`).
+- Tool bridge prompts now prefer Read/Glob for summarize/structure requests and warn against inventing schema fields such as `limit`.
+- Tool parser now strips input fields not declared in the forwarded tool `input_schema.properties` before returning `tool_use`.
 
 ### Fixed
 
 - Fixed Claude Code stream tool calls where the parser found `command` but Claude Code did not receive it because the proxy placed input only on `content_block_start`.
 - Fixed malformed Bash tool-call parsing for outputs such as `<arg_key>command": "git diff"</arg_value>`.
 - Fixed noisy logs that could not reliably distinguish local port conflicts, upstream APISIX errors, parser misses, and tool bridge failures.
+- Fixed Bash commands with truncated opening quotes being passed to Claude Code shell execution.
+- Fixed `Glob` tool failures caused by model-invented parameters such as `limit` being forwarded to Claude Code.
+- Fixed `tool-parse-miss` when DeepSeek returned `Tool: ToolName` + `Tool: {json}` or `<tool-calls>` inline tool blocks.
 
 ## [0.1.0] - 2026-05-19
 

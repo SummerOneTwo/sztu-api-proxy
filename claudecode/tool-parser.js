@@ -52,11 +52,14 @@ function parseToolCallDetailed(text, allowedTools) {
 function extractCandidates(text, tools) {
   return [
     ...extractDeepSeekTagCandidates(text),
+    ...extractToolUseCandidates(text),
+    ...extractToolCallsInlineCandidates(text, tools),
     ...extractNamedXmlCandidates(text),
     ...extractToolXmlCandidates(text),
     ...extractArgKeyCandidates(text),
     ...extractToolCallBlockCandidates(text, tools),
     ...extractToolArgumentsCandidates(text),
+    ...extractToolColonJsonCandidates(text, tools),
     ...extractJsonCandidates(text),
     ...extractFunctionCandidates(text, tools),
     ...extractPlainKeyValueCandidates(text, tools),
@@ -65,9 +68,34 @@ function extractCandidates(text, tools) {
 
 function extractDeepSeekTagCandidates(text) {
   const candidates = [];
-  const callRe = /<\|tool_call_begin\|>\s*([A-Za-z0-9_-]+)\s*(?:<\|tool_sep\|>|\n)\s*([\s\S]*?)(?=<\|tool_call_end\|>|<\|tool_call_begin\|>|<\|tool_calls_end\|>|<\/think>|$)/gi;
+  const callRe =
+    /<\|(?:redacted_)?tool_call_begin\|>\s*([A-Za-z0-9_-]+)\s*(?:<\|(?:redacted_)?tool_sep\|>|\n)\s*([\s\S]*?)(?=<\|(?:redacted_)?tool_call_end\|>|<\|(?:redacted_)?tool_call_begin\|>|<\|(?:redacted_)?tool_calls_end\|>|<\/think>|$)/gi;
   for (const match of text.matchAll(callRe)) {
     candidates.push({ format: "deepseek-tags", name: match[1], inputText: match[2], raw: match[0] });
+  }
+  return candidates;
+}
+
+function extractToolUseCandidates(text) {
+  const candidates = [];
+  const callRe = /<tool-use\s+name=["']?([A-Za-z0-9_-]+)["']?\s*>([\s\S]*?)(?=<\/tool-use>|<tool-use\b|$)/gi;
+  for (const match of text.matchAll(callRe)) {
+    candidates.push({ format: "tool-use-xml", name: match[1], inputText: match[2], raw: match[0] });
+  }
+  return candidates;
+}
+
+function extractToolCallsInlineCandidates(text, tools) {
+  const candidates = [];
+  const names = toolNamesPattern(tools);
+  const useRe = new RegExp(`<tool_use\\b[^>]*>\\s*(${names})\\s*:\\s*([\\s\\S]*?)\\s*<\\/tool_use>`, "gi");
+  for (const match of text.matchAll(useRe)) {
+    candidates.push({
+      format: "tool-calls-inline",
+      name: canonicalToolName(match[1], tools),
+      inputText: match[2],
+      raw: match[0],
+    });
   }
   return candidates;
 }
@@ -118,6 +146,30 @@ function extractToolArgumentsCandidates(text) {
   const callRe = /Tool:\s*([A-Za-z0-9_-]+)\s*(?:\n)+Arguments:\s*([\s\S]*?)(?=\n\s*Tool:\s*[A-Za-z0-9_-]+|<\/think>|$)/gi;
   for (const match of text.matchAll(callRe)) {
     candidates.push({ format: "tool-arguments", name: match[1], inputText: match[2], raw: match[0] });
+  }
+  return candidates;
+}
+
+function extractToolColonJsonCandidates(text, tools) {
+  const candidates = [];
+  const names = toolNamesPattern(tools);
+  const headerRe = new RegExp(`Tool:\\s*(${names})\\s+Tool:\\s*`, "gi");
+  let match;
+  while ((match = headerRe.exec(text)) !== null) {
+    const jsonStart = match.index + match[0].length;
+    if (text[jsonStart] !== "{") {
+      continue;
+    }
+    const jsonText = extractFirstJsonObject(text.slice(jsonStart));
+    if (!jsonText) {
+      continue;
+    }
+    candidates.push({
+      format: "tool-colon-json",
+      name: canonicalToolName(match[1], tools),
+      inputText: jsonText,
+      raw: text.slice(match.index, jsonStart + jsonText.length),
+    });
   }
   return candidates;
 }
@@ -186,7 +238,17 @@ function parseCandidate(candidate) {
   if (candidate.format === "json-envelope" || candidate.format === "json-object") {
     return parseJsonToolCandidate(candidate.inputText);
   }
-  if (candidate.format === "parameter-xml") {
+  if (candidate.format === "tool-colon-json") {
+    const parsed = parseLooseJson(candidate.inputText);
+    if (!parsed || typeof parsed !== "object") {
+      return null;
+    }
+    return {
+      name: candidate.name,
+      input: parsed.input && typeof parsed.input === "object" ? parsed.input : parsed,
+    };
+  }
+  if (candidate.format === "parameter-xml" || candidate.format === "tool-use-xml") {
     return {
       name: candidate.name,
       input: parseParameterXml(candidate.inputText),
@@ -198,10 +260,43 @@ function parseCandidate(candidate) {
       input: parseArgKeyXml(candidate.inputText),
     };
   }
+  if (candidate.format === "tool-calls-inline") {
+    return {
+      name: candidate.name,
+      input: parseInlineToolBody(candidate.name, candidate.inputText),
+    };
+  }
   return {
     name: candidate.name,
     input: parseInputText(candidate.inputText),
   };
+}
+
+function parseInlineToolBody(name, inputText) {
+  const text = String(inputText || "").trim();
+  if (!text) {
+    return {};
+  }
+  const jsonText = extractFirstJsonObject(text);
+  if (jsonText) {
+    const parsed = parseLooseJson(jsonText);
+    if (parsed && typeof parsed === "object") {
+      return parsed.input && typeof parsed.input === "object" ? parsed.input : parsed;
+    }
+  }
+  if (name === "Read" && !/[:=]/.test(text)) {
+    return { file_path: text };
+  }
+  if (name === "Bash") {
+    return { command: text };
+  }
+  if (name === "Glob" && !/[:=]/.test(text)) {
+    return { pattern: text };
+  }
+  if (name === "Grep" && !/[:=]/.test(text)) {
+    return { pattern: text };
+  }
+  return parseKeyValues(text);
 }
 
 function parseJsonToolCandidate(text) {
@@ -282,9 +377,25 @@ function finalizeTool(parsed, tools) {
     return null;
   }
 
-  const input = parsed.input && typeof parsed.input === "object" ? parsed.input : {};
+  const input = parsed.input && typeof parsed.input === "object" ? { ...parsed.input } : {};
+  for (const [key, value] of Object.entries(input)) {
+    if (typeof value === "string") {
+      input[key] = normalizeInputValue(value);
+    }
+  }
+  const allowedProps = allowed?.properties;
+  if (allowedProps && allowedProps.length > 0) {
+    for (const key of Object.keys(input)) {
+      if (!allowedProps.includes(key)) {
+        delete input[key];
+      }
+    }
+  }
   const required = allowed?.required || COMMON_REQUIRED[name] || [];
   if (required.some((key) => input[key] === undefined || input[key] === "")) {
+    return null;
+  }
+  if (name === "Bash" && typeof input.command === "string" && hasUnbalancedQuotes(input.command)) {
     return null;
   }
 
@@ -309,6 +420,7 @@ function normalizeAllowedTools(allowedTools) {
     map.set(tool.name.toLowerCase(), {
       name: tool.name,
       required: schemaRequired(tool.input_schema) || COMMON_REQUIRED[tool.name] || [],
+      properties: schemaProperties(tool.input_schema),
     });
   }
   return map.size > 0 ? map : null;
@@ -316,6 +428,13 @@ function normalizeAllowedTools(allowedTools) {
 
 function schemaRequired(schema) {
   return Array.isArray(schema?.required) ? schema.required.filter((key) => typeof key === "string") : null;
+}
+
+function schemaProperties(schema) {
+  if (!schema?.properties || typeof schema.properties !== "object") {
+    return null;
+  }
+  return Object.keys(schema.properties).filter((key) => typeof key === "string");
 }
 
 function normalizeText(text) {
@@ -333,10 +452,53 @@ function removeCodeFences(text) {
 }
 
 function unquote(value) {
-  if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
-    return value.slice(1, -1);
+  const trimmed = String(value || "").trim();
+  if (
+    (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+    (trimmed.startsWith("'") && trimmed.endsWith("'"))
+  ) {
+    return trimmed.slice(1, -1);
   }
-  return value.trim();
+  // Truncated model output often leaves a lone opening quote; keep the command body.
+  if (
+    (trimmed.startsWith('"') && !trimmed.endsWith('"')) ||
+    (trimmed.startsWith("'") && !trimmed.endsWith("'"))
+  ) {
+    return trimmed.slice(1);
+  }
+  return trimmed;
+}
+
+function hasUnbalancedQuotes(value) {
+  const text = String(value || "");
+  let inSingle = false;
+  let inDouble = false;
+  let escaped = false;
+  for (const char of text) {
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (char === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (char === "'" && !inDouble) {
+      inSingle = !inSingle;
+      continue;
+    }
+    if (char === '"' && !inSingle) {
+      inDouble = !inDouble;
+    }
+  }
+  return inSingle || inDouble;
+}
+
+function normalizeInputValue(value) {
+  if (typeof value !== "string") {
+    return value;
+  }
+  return unquote(value);
 }
 
 function canonicalToolName(name, tools) {
