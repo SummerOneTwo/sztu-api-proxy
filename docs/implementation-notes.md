@@ -355,6 +355,27 @@ The final `message_delta` includes:
 
 This is required for Claude Code to show usage correctly.
 
+For streaming `tool_use`, Claude Code expects Anthropic-style input deltas. The
+proxy must send:
+
+```text
+content_block_start  tool_use with input: {}
+content_block_delta  input_json_delta with partial_json: "{\"command\":\"git diff\"}"
+content_block_stop
+```
+
+Putting the full tool input only on `content_block_start.content_block.input`
+can make Claude Code display an empty `IN` block and reject tools such as Bash
+with:
+
+```text
+The required parameter `command` is missing
+```
+
+This can happen even when the proxy parser log shows `inputKeys:["command"]`,
+because the parser had the command but the SSE event shape did not deliver it in
+the format Claude Code consumes.
+
 ### Claude Code Health Probe
 
 Claude Code sends `HEAD /` probes. The proxy logs these as `not-found`, which
@@ -490,7 +511,90 @@ Arguments: {"file_path":"..."}
 </tool_call>
 ```
 
+6. Claude Code UI-style plain text:
+
+```text
+Read
+
+Read: file_path: "C:\path\file.md"
+```
+
+7. Function-call-looking text:
+
+```text
+Read({"file_path":"C:\path\file.md"})
+```
+
+8. Broken repeated tool calls mixed with reasoning tags:
+
+```text
+<tool_call>Glob
+pattern:
+**/proxy.js
+</think><tool_call>Glob
+pattern:
+**/.env
+</think>
+```
+
+The proxy takes the first parseable tool call from this format. It does not try
+to execute multiple tool calls from one malformed assistant message.
+
+9. DeepSeek-style tool tags with full-width separators:
+
+```text
+<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>Glob<｜tool▁sep｜>{"pattern":"**/proxy.js"}<｜tool▁call▁end｜><｜tool▁calls▁end｜>
+```
+
+10. JSON arrays of tool calls:
+
+```text
+<tool_call>[{"name":"Glob","input":{"pattern":"**/*.js"}}]</tool_call>
+```
+
+11. Malformed `arg_key` entries where the model puts the key/value pair inside
+    the tag body:
+
+```text
+<tool_call>Bash<arg_key>command": "git diff"</arg_value></tool_call>
+```
+
 All of these are normalized to Anthropic `tool_use`.
+
+The parser is now split into:
+
+```text
+claudecode/tool-parser.js
+```
+
+The design follows the useful idea from `NIyueeE/ds-free-api`: treat tool calls
+as a repair pipeline instead of a single strict regex. The local implementation
+does not copy that project's GPL code. It applies these steps:
+
+```text
+1. Normalize known tag variants and text quirks.
+2. Remove fenced code blocks so examples are not executed as real tools.
+3. Extract multiple candidate tool calls from strict and malformed tags.
+4. Try loose XML, arg_key/arg_value, function-call, and key/value formats.
+5. Repair small JSON defects such as single quotes, trailing commas, unquoted
+   keys, and unescaped Windows backslashes.
+6. Enforce the Claude Code tool whitelist and required input fields.
+7. Return the first valid candidate; otherwise return diagnostic metadata for
+   logging.
+```
+
+This matters because a malformed tool call should not be silently treated as a
+normal assistant answer when Claude Code is waiting for `tool_use`.
+
+Parser-only regression test:
+
+```powershell
+node .\scripts\test-tool-parser.js
+```
+
+This test includes the `Read / Read: file_path: ...` failure format, escaped
+and unescaped Windows paths, DeepSeek-style tags, JSON arrays, code-fence false
+positives, allowed-tool filtering, and missing required arguments.
 
 ### Tool Result History
 
@@ -602,6 +706,63 @@ Known limitations:
 - Image/document inputs are currently omitted as text placeholders.
 
 ## Security and Open Source Hygiene
+
+## Runtime Logs
+
+The proxy logs are kept under each proxy's ignored `.runtime` directory:
+
+```text
+opencode/.runtime/opencode-proxy.log
+codebuddy/.runtime/codebuddy-proxy.log
+claudecode/.runtime/claudecode-proxy.log
+```
+
+The logs use JSON Lines. Each line is one event and includes:
+
+```text
+ts          ISO timestamp
+service     opencode / codebuddy / claudecode
+event       request, upstream-response-start, response, upstream-error-response, ...
+requestId   stable id for one client request
+durationMs  elapsed time for upstream/response events
+```
+
+Useful debugging flow:
+
+```powershell
+rg "cc_mpc..." .\claudecode\.runtime\claudecode-proxy.log
+rg '"event":"upstream-error-response"' .\**\.runtime\*.log
+rg '"event":"tool-parse-hit"' .\claudecode\.runtime\claudecode-proxy.log
+```
+
+For every proxied request, the logs record sanitized summaries for both client
+and upstream bodies:
+
+```text
+model, stream, max_tokens, message count, role list, content size,
+last user preview, tool count, tool names, stream options, thinking flags
+```
+
+They intentionally do not log real API keys or Authorization headers.
+
+Claude Code additionally logs:
+
+```text
+tool-parse-hit        model text was converted into Anthropic tool_use
+tool-parse-miss       model looked like a tool call but no valid tool_use was produced
+modelTextPreview      short preview of the raw tool-call text
+inputKeys             tool input keys parsed from the model output
+upstream-retryable-*  GLM/DS 5xx retry attempts
+```
+
+This makes the common failure modes distinguishable:
+
+```text
+listen EADDRINUSE             local port already occupied
+upstream-error-response 502   SZTU/APISIX upstream failure
+tool-parse-hit missing        model answered text instead of a parseable tool call
+bad-upstream-sse              upstream emitted malformed SSE JSON
+```
 
 Do:
 

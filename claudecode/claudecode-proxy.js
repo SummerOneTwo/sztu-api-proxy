@@ -2,6 +2,8 @@ const http = require("http");
 const fs = require("fs");
 const path = require("path");
 const { getApiKey, envNumber, loadDotEnv } = require("../shared/env");
+const { createLogger, durationMs, makeRequestId, preview, summarizeAnthropicBody, summarizeBody } = require("../shared/logger");
+const { parseToolCallDetailed } = require("./tool-parser");
 
 loadDotEnv();
 
@@ -18,10 +20,7 @@ const MAX_TOKENS = envNumber("SZTU_MAX_TOKENS", 32768);
 
 fs.mkdirSync(RUNTIME_DIR, { recursive: true });
 
-function log(message, extra) {
-  const suffix = extra === undefined ? "" : ` ${JSON.stringify(extra)}`;
-  fs.appendFileSync(LOG_PATH, `[${new Date().toISOString()}] ${message}${suffix}\n`, "utf8");
-}
+const log = createLogger("claudecode", LOG_PATH);
 
 function readApiKey() {
   return getApiKey();
@@ -40,13 +39,13 @@ async function fetchWithRetry(url, options) {
         return response;
       }
       const text = await response.text().catch(() => "");
-      log("upstream-retryable-status", { attempt, status: response.status, text: text.slice(0, 500) });
+      log("upstream-retryable-status", { attempt, status: response.status, bodyPreview: preview(text, 1000) });
     } catch (error) {
       lastError = error;
       if (attempt === 3) {
         break;
       }
-      log("upstream-retryable-error", { attempt, message: error.message, cause: error.cause?.message });
+      log("upstream-retryable-error", { attempt, error });
     }
     await delay(500 * attempt);
   }
@@ -326,11 +325,11 @@ function stopReason(reason) {
   return "end_turn";
 }
 
-function toAnthropicMessage(payload, requestedModel) {
+function toAnthropicMessage(payload, requestedModel, tools, requestId) {
   const choice = payload?.choices?.[0] || {};
   const message = choice.message || {};
   const content = [];
-  const parsedTool = parseToolCallText(message.content);
+  const parsedTool = parseToolWithLog(message.content, tools, requestId, false);
 
   if (parsedTool) {
     content.push(parsedTool);
@@ -362,6 +361,38 @@ function toAnthropicMessage(payload, requestedModel) {
   };
 }
 
+function parseToolWithLog(text, tools, requestId, stream) {
+  const result = parseToolCallDetailed(text, tools);
+  if (result.tool) {
+    log("tool-parse-hit", {
+      requestId,
+      stream,
+      tool: result.tool.name,
+      inputKeys: Object.keys(result.tool.input || {}),
+      matchedFormat: result.matchedFormat,
+      candidates: result.candidates,
+      rejected: result.rejected,
+      modelTextPreview: preview(text, 1000),
+    });
+    return result.tool;
+  }
+  if (result.candidates > 0 || looksLikeToolText(text)) {
+    log("tool-parse-miss", {
+      requestId,
+      stream,
+      reason: result.reason,
+      candidates: result.candidates,
+      rejected: result.rejected,
+      modelTextPreview: preview(text, 1000),
+    });
+  }
+  return null;
+}
+
+function looksLikeToolText(text) {
+  return typeof text === "string" && /<tool|tool_call|Tool:\s|Arguments:|<\/think>|<\|tool/i.test(text);
+}
+
 function safeJson(text) {
   if (typeof text !== "string" || !text) {
     return {};
@@ -373,127 +404,12 @@ function safeJson(text) {
   }
 }
 
-function parseToolCallText(text) {
-  if (typeof text !== "string") {
-    return null;
-  }
-  const looseTool = text.match(/Tool:\s*([A-Za-z0-9_-]+)\s*(?:\r?\n)+Arguments:\s*([\s\S]+)/i);
-  if (looseTool) {
-    const argsText = extractFirstJsonObject(looseTool[2]) || "{}";
-    return {
-      type: "tool_use",
-      id: `toolu_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
-      name: looseTool[1],
-      input: safeJson(argsText),
-    };
-  }
-  const namedXmlTool = text.match(/<tool_call\s+name=["']?([A-Za-z0-9_-]+)["']?>\s*([\s\S]*?)\s*<\/tool_call>/i);
-  if (namedXmlTool) {
-    const argsText = extractFirstJsonObject(namedXmlTool[2]) || "{}";
-    return {
-      type: "tool_use",
-      id: `toolu_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
-      name: namedXmlTool[1],
-      input: safeJson(argsText),
-    };
-  }
-  const parameterXmlTool = text.match(/<tool\s+name=["']?([A-Za-z0-9_-]+)["']?>\s*([\s\S]*?)<\/tool>/i) ||
-    text.match(/<tool\s+name=["']?([A-Za-z0-9_-]+)["']?>\s*([\s\S]*)/i);
-  if (parameterXmlTool) {
-    const input = {};
-    const params = parameterXmlTool[2].matchAll(/<parameter\s+name=["']?([^"'>\s]+)["']?>\s*([\s\S]*?)\s*<\/parameter>/gi);
-    for (const param of params) {
-      input[param[1]] = param[2].trim();
-    }
-    return {
-      type: "tool_use",
-      id: `toolu_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
-      name: parameterXmlTool[1],
-      input,
-    };
-  }
-  const argKeyTool = text.match(/<tool_call>\s*([A-Za-z0-9_-]+)\s*([\s\S]*?)<\/tool_call>/i);
-  if (argKeyTool) {
-    const input = {};
-    const pairs = argKeyTool[2].matchAll(/<arg_key>\s*([\s\S]*?)\s*<\/arg_key>\s*<arg_value>\s*([\s\S]*?)\s*<\/arg_value>/gi);
-    for (const pair of pairs) {
-      input[pair[1].trim()] = pair[2].trim();
-    }
-    return {
-      type: "tool_use",
-      id: `toolu_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
-      name: argKeyTool[1],
-      input,
-    };
-  }
-  const match = text.match(/<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/i);
-  const jsonText = match ? match[1] : extractFirstJsonObject(text);
-  if (!jsonText) {
-    return null;
-  }
-  let parsed;
-  try {
-    parsed = JSON.parse(jsonText);
-  } catch {
-    return null;
-  }
-  if (!parsed || typeof parsed.name !== "string") {
-    return null;
-  }
-  return {
-    type: "tool_use",
-    id: `toolu_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
-    name: parsed.name,
-    input: parsed.input && typeof parsed.input === "object" ? parsed.input : {},
-  };
-}
-
-function extractFirstJsonObject(text) {
-  if (typeof text !== "string") {
-    return null;
-  }
-  const start = text.indexOf("{");
-  if (start < 0) {
-    return null;
-  }
-  let depth = 0;
-  let inString = false;
-  let escaped = false;
-  for (let index = start; index < text.length; index++) {
-    const char = text[index];
-    if (escaped) {
-      escaped = false;
-      continue;
-    }
-    if (char === "\\") {
-      escaped = true;
-      continue;
-    }
-    if (char === '"') {
-      inString = !inString;
-      continue;
-    }
-    if (inString) {
-      continue;
-    }
-    if (char === "{") {
-      depth++;
-    } else if (char === "}") {
-      depth--;
-      if (depth === 0) {
-        return text.slice(start, index + 1);
-      }
-    }
-  }
-  return null;
-}
-
 function writeSse(res, event, data) {
   res.write(`event: ${event}\n`);
   res.write(`data: ${JSON.stringify(data)}\n\n`);
 }
 
-function streamAnthropicFromUpstream(res, upstreamRes, requestedModel) {
+function streamAnthropicFromUpstream(res, upstreamRes, requestedModel, tools, requestId, startedAt) {
   const id = `msg_${Date.now()}`;
   const createdMessage = {
     type: "message_start",
@@ -529,7 +445,7 @@ function streamAnthropicFromUpstream(res, upstreamRes, requestedModel) {
     try {
       chunk = JSON.parse(dataText);
     } catch (error) {
-      log("bad-upstream-sse", { data: dataText.slice(0, 500), error: error.message });
+      log("bad-upstream-sse", { requestId, dataPreview: preview(dataText, 1000), error });
       return;
     }
 
@@ -591,12 +507,26 @@ function streamAnthropicFromUpstream(res, upstreamRes, requestedModel) {
         handleData(dataLine);
       }
     }
-    const parsedTool = parseToolCallText(text);
+    const parsedTool = parseToolWithLog(text, tools, requestId, true);
     if (parsedTool) {
+      const inputJson = JSON.stringify(parsedTool.input || {});
       writeSse(res, "content_block_start", {
         type: "content_block_start",
         index: 0,
-        content_block: parsedTool,
+        content_block: {
+          type: "tool_use",
+          id: parsedTool.id,
+          name: parsedTool.name,
+          input: {},
+        },
+      });
+      writeSse(res, "content_block_delta", {
+        type: "content_block_delta",
+        index: 0,
+        delta: {
+          type: "input_json_delta",
+          partial_json: inputJson,
+        },
       });
       writeSse(res, "content_block_stop", { type: "content_block_stop", index: 0 });
       stop = "tool_use";
@@ -619,10 +549,17 @@ function streamAnthropicFromUpstream(res, upstreamRes, requestedModel) {
       usage: { input_tokens: usage.input_tokens, output_tokens: usage.output_tokens },
     });
     writeSse(res, "message_stop", { type: "message_stop" });
-    log("stream-response", { stop_reason: stop, usage });
+    log("stream-response", {
+      requestId,
+      status: upstreamRes.status,
+      stop_reason: stop,
+      usage,
+      textChars: text.length,
+      durationMs: durationMs(startedAt),
+    });
     res.end();
   })().catch((error) => {
-    log("stream-error", { message: error.message });
+    log("stream-error", { requestId, durationMs: durationMs(startedAt), error });
     if (!res.destroyed) {
       res.end();
     }
@@ -630,20 +567,23 @@ function streamAnthropicFromUpstream(res, upstreamRes, requestedModel) {
 }
 
 function proxyMessages(req, res, body) {
+  const requestId = makeRequestId("cc");
+  const startedAt = Date.now();
   const apiKey = readApiKey();
   if (!apiKey) {
+    log("missing-api-key", { requestId });
     writeJson(res, 500, { error: { type: "api_error", message: "missing SZTU API key" } });
     return;
   }
 
   const upstreamBody = buildUpstreamBody(body);
   log("request", {
-    requestedModel: body.model,
-    upstreamModel: upstreamBody.model,
-    stream: upstreamBody.stream,
-    max_tokens: upstreamBody.max_tokens,
-    messages: upstreamBody.messages.length,
-    tools: Array.isArray(upstreamBody.tools) ? upstreamBody.tools.length : 0,
+    requestId,
+    method: req.method,
+    url: req.url,
+    client: summarizeAnthropicBody(body),
+    upstream: summarizeBody(upstreamBody),
+    upstreamBytes: Buffer.byteLength(JSON.stringify(upstreamBody)),
   });
 
   const payload = JSON.stringify(upstreamBody);
@@ -659,10 +599,21 @@ function proxyMessages(req, res, body) {
 
   upstream
     .then(async (upstreamRes) => {
+      log("upstream-response-start", {
+        requestId,
+        status: upstreamRes.status,
+        contentType: upstreamRes.headers.get("content-type"),
+        durationMs: durationMs(startedAt),
+      });
       if (upstreamBody.stream) {
         if (!upstreamRes.ok) {
           const text = await upstreamRes.text();
-          log("upstream-error-response", { status: upstreamRes.status, text: text.slice(0, 1000) });
+          log("upstream-error-response", {
+            requestId,
+            status: upstreamRes.status,
+            bodyPreview: preview(text, 2000),
+            durationMs: durationMs(startedAt),
+          });
           writeJson(res, upstreamRes.status, {
             error: {
               type: "api_error",
@@ -675,29 +626,36 @@ function proxyMessages(req, res, body) {
           writeJson(res, 502, { error: { type: "api_error", message: "missing upstream stream body" } });
           return;
         }
-        streamAnthropicFromUpstream(res, upstreamRes, body.model);
+        streamAnthropicFromUpstream(res, upstreamRes, body.model, body.tools, requestId, startedAt);
         return;
       }
 
       const text = await upstreamRes.text();
       if (!upstreamRes.ok) {
-        log("upstream-error-response", { status: upstreamRes.status, text: text.slice(0, 1000) });
+        log("upstream-error-response", {
+          requestId,
+          status: upstreamRes.status,
+          bodyPreview: preview(text, 2000),
+          durationMs: durationMs(startedAt),
+        });
         res.writeHead(upstreamRes.status, { "content-type": "application/json; charset=utf-8" });
         res.end(text);
         return;
       }
       const data = JSON.parse(text);
-      const anthropic = toAnthropicMessage(data, body.model);
+      const anthropic = toAnthropicMessage(data, body.model, body.tools, requestId);
       log("response", {
+        requestId,
         status: upstreamRes.status,
         stop_reason: anthropic.stop_reason,
         usage: anthropic.usage,
         contentTypes: anthropic.content.map((part) => part.type),
+        durationMs: durationMs(startedAt),
       });
       writeJson(res, 200, anthropic);
     })
     .catch((error) => {
-      log("proxy-error", { message: error.message, cause: error.cause?.message });
+      log("proxy-error", { requestId, durationMs: durationMs(startedAt), error });
       writeJson(res, 502, { error: { type: "api_error", message: error.message } });
     });
 }
@@ -710,14 +668,14 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     if (req.method !== "POST" || pathName !== "/v1/messages") {
-      log("not-found", { method: req.method, url: req.url, pathName });
+      log("not-found", { requestId: makeRequestId("cc"), method: req.method, url: req.url, pathName });
       writeJson(res, 404, { error: { type: "not_found_error", message: "not found" } });
       return;
     }
     const body = await readJson(req);
     proxyMessages(req, res, body);
   } catch (error) {
-    log("server-error", { message: error.message, stack: error.stack });
+    log("server-error", { error });
     writeJson(res, 500, { error: { type: "api_error", message: error.message } });
   }
 });

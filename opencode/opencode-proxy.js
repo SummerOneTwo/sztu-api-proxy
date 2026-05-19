@@ -2,6 +2,7 @@ const http = require("http");
 const fs = require("fs");
 const path = require("path");
 const { getApiKey, envNumber } = require("../shared/env");
+const { createLogger, durationMs, makeRequestId, preview, summarizeBody } = require("../shared/logger");
 
 const HOST = "127.0.0.1";
 const PORT = envNumber("OPENCODE_PROXY_PORT", 8788);
@@ -16,10 +17,7 @@ const MAX_TOKENS = envNumber("SZTU_MAX_TOKENS", 32768);
 
 fs.mkdirSync(RUNTIME_DIR, { recursive: true });
 
-function log(message, extra) {
-  const suffix = extra === undefined ? "" : ` ${JSON.stringify(extra)}`;
-  fs.appendFileSync(LOG_PATH, `[${new Date().toISOString()}] ${message}${suffix}\n`, "utf8");
-}
+const log = createLogger("opencode", LOG_PATH);
 
 function readApiKey() {
   return getApiKey();
@@ -205,8 +203,11 @@ function transformSseEvent(eventText, upstreamModel) {
 }
 
 function proxyRequest(req, res, body) {
+  const requestId = makeRequestId("oc");
+  const startedAt = Date.now();
   const apiKey = readApiKey();
   if (!apiKey) {
+    log("missing-api-key", { requestId });
     writeJson(res, 500, { error: "missing SZTU API key" });
     return;
   }
@@ -214,13 +215,12 @@ function proxyRequest(req, res, body) {
   const upstreamBody = normalizeBody(body);
   const payload = JSON.stringify(upstreamBody);
   log("request", {
-    model: body.model,
-    upstreamModel: upstreamBody.model,
-    thinking: upstreamBody.chat_template_kwargs,
-    stream: upstreamBody.stream === true,
-    messages: Array.isArray(upstreamBody.messages) ? upstreamBody.messages.length : 0,
-    tools: Array.isArray(upstreamBody.tools) ? upstreamBody.tools.length : 0,
-    max_tokens: upstreamBody.max_tokens,
+    requestId,
+    method: req.method,
+    url: req.url,
+    client: summarizeBody(body),
+    upstream: summarizeBody(upstreamBody),
+    upstreamBytes: Buffer.byteLength(payload),
   });
 
   fetch(`https://${UPSTREAM_HOST}${UPSTREAM_PATH}`, {
@@ -233,17 +233,24 @@ function proxyRequest(req, res, body) {
     body: payload,
   })
     .then(async (upstreamRes) => {
+      const contentType = upstreamRes.headers.get("content-type") || "";
+      log("upstream-response-start", {
+        requestId,
+        status: upstreamRes.status,
+        contentType,
+        durationMs: durationMs(startedAt),
+      });
       res.writeHead(upstreamRes.status, {
         "Content-Type":
           upstreamBody.stream === true
             ? "text/event-stream; charset=utf-8"
-            : upstreamRes.headers.get("content-type") || "application/json; charset=utf-8",
+            : contentType || "application/json; charset=utf-8",
         "Cache-Control": upstreamRes.headers.get("cache-control") || "no-cache",
         Connection: "keep-alive",
       });
 
       if (!upstreamRes.body) {
-        log("response", { status: upstreamRes.status, bytes: 0 });
+        log("response", { requestId, status: upstreamRes.status, bytes: 0, durationMs: durationMs(startedAt) });
         res.end();
         return;
       }
@@ -272,11 +279,17 @@ function proxyRequest(req, res, body) {
       if (sseBuffer) {
         res.write(transformSseEvent(sseBuffer, upstreamBody.model));
       }
-      log("response", { status: upstreamRes.status, bytes });
+      log("response", {
+        requestId,
+        status: upstreamRes.status,
+        bytes,
+        durationMs: durationMs(startedAt),
+        errorPreview: upstreamRes.status >= 400 ? preview(sseBuffer, 1000) : undefined,
+      });
       res.end();
     })
     .catch((error) => {
-      log("upstream-error", { message: error.message, cause: error.cause?.message });
+      log("upstream-error", { requestId, durationMs: durationMs(startedAt), error });
       if (!res.headersSent) {
         writeJson(res, 502, { error: error.message, cause: error.cause?.message });
         return;

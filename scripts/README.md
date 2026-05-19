@@ -39,6 +39,12 @@ node .\scripts\test-api.js opencode codebuddy
 node .\scripts\test-api.js all
 ```
 
+Parser-only check for Claude Code tool-call formats:
+
+```powershell
+node .\scripts\test-tool-parser.js
+```
+
 The Claude Code suite checks:
 
 - health endpoint
@@ -48,3 +54,12 @@ The Claude Code suite checks:
 - DeepSeek streaming usage
 - GLM prompt-mediated tool bridge
 - DeepSeek prompt-mediated tool bridge
+
+When a proxy test fails, check the JSONL runtime logs and search by
+`requestId`:
+
+```powershell
+Get-Content -Tail 30 .\claudecode\.runtime\claudecode-proxy.log
+Get-Content -Tail 30 .\codebuddy\.runtime\codebuddy-proxy.log
+Get-Content -Tail 30 .\opencode\.runtime\opencode-proxy.log
+```

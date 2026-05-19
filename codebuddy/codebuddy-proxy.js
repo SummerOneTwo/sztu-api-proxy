@@ -3,6 +3,7 @@ const https = require("https");
 const fs = require("fs");
 const path = require("path");
 const { getApiKey, envNumber } = require("../shared/env");
+const { createLogger, durationMs, makeRequestId, preview, summarizeBody: summarizeSharedBody } = require("../shared/logger");
 
 const PORT = envNumber("CODEBUDDY_PROXY_PORT", envNumber("PORT", 8787));
 const TARGET_HOST = "apiai.sztu.edu.cn";
@@ -15,19 +16,16 @@ const SZTU_MAX_TOKENS = envNumber("SZTU_MAX_TOKENS", 32768);
 
 fs.mkdirSync(LOG_DIR, { recursive: true });
 
-function log(message) {
-  const line = `[${new Date().toISOString()}] ${message}\n`;
-  fs.appendFileSync(LOG_PATH, line, "utf8");
-}
+const log = createLogger("codebuddy", LOG_PATH);
 
 function cleanupAndExit(signal) {
-  log(`shutdown signal=${signal}`);
+  log("shutdown", { signal });
   try {
     if (fs.existsSync(PID_PATH)) {
       fs.unlinkSync(PID_PATH);
     }
   } catch (error) {
-    log(`pid-cleanup-error ${String(error)}`);
+    log("pid-cleanup-error", { error });
   }
   process.exit(0);
 }
@@ -233,7 +231,7 @@ function chatCompletionsToResponses(payload) {
   };
 }
 
-function summarizeBody(body) {
+function summarizeCodebuddyBody(body) {
   const messages = Array.isArray(body?.messages) ? body.messages : [];
   const inputItems = Array.isArray(body?.input) ? body.input : [];
   const contentChars = messages.reduce((sum, message) => {
@@ -266,16 +264,28 @@ function writeSseDone(res) {
   res.end();
 }
 
-function forwardChatCompletionStream(res, upstreamRes) {
+function forwardChatCompletionStream(res, upstreamRes, requestId, startedAt) {
   res.writeHead(upstreamRes.statusCode || 200, {
     "Content-Type": "text/event-stream; charset=utf-8",
     "Cache-Control": upstreamRes.headers["cache-control"] || "no-cache",
     Connection: "keep-alive",
   });
+  let bytes = 0;
+  upstreamRes.on("data", (chunk) => {
+    bytes += chunk.length;
+  });
+  upstreamRes.on("end", () => {
+    log("stream-response", {
+      requestId,
+      status: upstreamRes.statusCode,
+      bytes,
+      durationMs: durationMs(startedAt),
+    });
+  });
   upstreamRes.pipe(res);
 }
 
-function emitResponsesStreamFromChatStream(res, upstreamRes) {
+function emitResponsesStreamFromChatStream(res, upstreamRes, requestId, startedAt) {
   const createdAt = Math.floor(Date.now() / 1000);
   const responseId = `resp_${Date.now()}`;
   let model;
@@ -366,7 +376,7 @@ function emitResponsesStreamFromChatStream(res, upstreamRes) {
     try {
       chunk = JSON.parse(dataText);
     } catch (error) {
-      log(`invalid-upstream-sse-json ${String(error)} raw=${dataText.slice(0, 1000)}`);
+      log("invalid-upstream-sse-json", { requestId, error, dataPreview: preview(dataText, 1000) });
       return;
     }
 
@@ -416,6 +426,14 @@ function emitResponsesStreamFromChatStream(res, upstreamRes) {
       handleEvent(buffer);
     }
     complete();
+    log("responses-stream-response", {
+      requestId,
+      status: upstreamRes.statusCode,
+      usage,
+      finishReason,
+      outputChars: outputText.length,
+      durationMs: durationMs(startedAt),
+    });
   });
 }
 
@@ -429,7 +447,10 @@ function writeJson(res, status, payload) {
 }
 
 const server = http.createServer((req, res) => {
+  const requestId = makeRequestId("cb");
+  const startedAt = Date.now();
   if (req.method !== "POST" || (req.url !== "/v1/chat/completions" && req.url !== "/v1/responses")) {
+    log("not-found", { requestId, method: req.method, url: req.url });
     writeJson(res, 404, { error: "not found" });
     return;
   }
@@ -443,7 +464,7 @@ const server = http.createServer((req, res) => {
     try {
       body = JSON.parse(raw);
     } catch (error) {
-      log(`invalid-json ${String(error)}`);
+      log("invalid-json", { requestId, error, bodyPreview: preview(raw, 1000) });
       writeJson(res, 400, { error: "invalid json" });
       return;
     }
@@ -454,10 +475,21 @@ const server = http.createServer((req, res) => {
     const upstreamBody = nextBody;
     const apiKey = getApiKey();
     if (!apiKey) {
+      log("missing-api-key", { requestId });
       writeJson(res, 500, { error: "missing SZTU_API_KEY in environment or .env" });
       return;
     }
-    log(`request body=${JSON.stringify(summarizeBody(body))} sanitized=${JSON.stringify(summarizeBody(nextBody))} upstream=${JSON.stringify(summarizeBody(upstreamBody))}`);
+    const payload = JSON.stringify(upstreamBody);
+    log("request", {
+      requestId,
+      method: req.method,
+      url: req.url,
+      isResponsesApi,
+      client: summarizeSharedBody(body),
+      sanitized: summarizeCodebuddyBody(nextBody),
+      upstream: summarizeSharedBody(upstreamBody),
+      upstreamBytes: Buffer.byteLength(payload),
+    });
 
     const upstream = https.request(
       {
@@ -471,12 +503,17 @@ const server = http.createServer((req, res) => {
         },
       },
       (upstreamRes) => {
-        log(`response status=${upstreamRes.statusCode}`);
+        log("upstream-response-start", {
+          requestId,
+          status: upstreamRes.statusCode,
+          contentType: upstreamRes.headers["content-type"],
+          durationMs: durationMs(startedAt),
+        });
         if (wantsStream && (upstreamRes.statusCode || 500) < 400) {
           if (isResponsesApi) {
-            emitResponsesStreamFromChatStream(res, upstreamRes);
+            emitResponsesStreamFromChatStream(res, upstreamRes, requestId, startedAt);
           } else {
-            forwardChatCompletionStream(res, upstreamRes);
+            forwardChatCompletionStream(res, upstreamRes, requestId, startedAt);
           }
           return;
         }
@@ -489,6 +526,12 @@ const server = http.createServer((req, res) => {
           const text = rawResponse.toString("utf8");
 
           if ((upstreamRes.statusCode || 500) >= 400) {
+            log("upstream-error-response", {
+              requestId,
+              status: upstreamRes.statusCode,
+              bodyPreview: preview(text, 2000),
+              durationMs: durationMs(startedAt),
+            });
             res.writeHead(upstreamRes.statusCode || 502, {
               "Content-Type": "application/json; charset=utf-8",
             });
@@ -498,6 +541,15 @@ const server = http.createServer((req, res) => {
 
           try {
             const payload = JSON.parse(text);
+            log("response", {
+              requestId,
+              status: upstreamRes.statusCode,
+              bytes: rawResponse.length,
+              usage: payload?.usage,
+              choices: Array.isArray(payload?.choices) ? payload.choices.length : undefined,
+              finishReason: payload?.choices?.[0]?.finish_reason,
+              durationMs: durationMs(startedAt),
+            });
             if (!isResponsesApi) {
               const headers = {
                 "Content-Type": upstreamRes.headers["content-type"] || "application/json; charset=utf-8",
@@ -512,7 +564,7 @@ const server = http.createServer((req, res) => {
 
             writeJson(res, upstreamRes.statusCode || 200, chatCompletionsToResponses(payload));
           } catch (error) {
-            log(`invalid-upstream-json ${String(error)} raw=${text.slice(0, 4000)}`);
+            log("invalid-upstream-json", { requestId, error, bodyPreview: preview(text, 4000) });
             writeJson(res, 502, { error: "invalid upstream json" });
           }
         });
@@ -520,7 +572,7 @@ const server = http.createServer((req, res) => {
     );
 
     upstream.on("error", (error) => {
-      log(`upstream-error ${String(error)}`);
+      log("upstream-error", { requestId, durationMs: durationMs(startedAt), error });
       if (!res.headersSent) {
         writeJson(res, 502, { error: String(error) });
         return;
@@ -528,18 +580,18 @@ const server = http.createServer((req, res) => {
       res.end();
     });
 
-    upstream.write(JSON.stringify(upstreamBody));
+    upstream.write(payload);
     upstream.end();
   });
 });
 
 server.listen(PORT, "127.0.0.1", () => {
   fs.writeFileSync(PID_PATH, String(process.pid), "utf8");
-  log(`listening http://127.0.0.1:${PORT}`);
+  log("listening", { host: "127.0.0.1", port: PORT });
 });
 
 server.on("error", (error) => {
-  log(`server-error ${String(error)}`);
+  log("server-error", { error });
 });
 
 process.on("SIGINT", () => cleanupAndExit("SIGINT"));
@@ -550,6 +602,6 @@ process.on("exit", () => {
       fs.unlinkSync(PID_PATH);
     }
   } catch (error) {
-    log(`pid-exit-cleanup-error ${String(error)}`);
+    log("pid-exit-cleanup-error", { error });
   }
 });
