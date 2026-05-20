@@ -38,18 +38,27 @@ function normalizeMaxTokens(value) {
   return Math.min(Math.trunc(n), SZTU_DEFAULT_MAX_TOKENS, SZTU_MAX_TOKENS);
 }
 
+function normalizeModel(value) {
+  const raw = typeof value === "string" ? value : "";
+  const model = raw.split(":").pop().split("/").pop();
+  if (model === "deepseek-v4-pro") {
+    return "deepseek-v4-pro";
+  }
+  return "glm-5.1";
+}
+
 function sanitizeBody(body) {
   const next = { ...body };
+  next.model = normalizeModel(next.model);
 
   const requestedMaxTokens = normalizeMaxTokens(
     next.max_tokens ?? next.max_completion_tokens ?? next.max_output_tokens
   );
   if (requestedMaxTokens !== undefined) {
     next.max_tokens = requestedMaxTokens;
-    if (next.max_completion_tokens !== undefined) {
-      next.max_completion_tokens = requestedMaxTokens;
-    }
   }
+  delete next.max_completion_tokens;
+  delete next.max_output_tokens;
 
   // Keep unsupported request knobs out, but preserve the OpenAI tool-calling
   // fields CodeBuddy needs to execute tools across turns.
@@ -66,13 +75,19 @@ function sanitizeBody(body) {
     delete next.stream_options;
   }
 
+  const template = next.chat_template_kwargs && typeof next.chat_template_kwargs === "object"
+    ? next.chat_template_kwargs
+    : {};
   if (next.model === "deepseek-v4-pro") {
     next.chat_template_kwargs = {
-      ...(next.chat_template_kwargs && typeof next.chat_template_kwargs === "object"
-        ? next.chat_template_kwargs
-        : {}),
+      ...template,
       thinking: true,
       reasoning_effort: "max",
+    };
+  } else {
+    next.chat_template_kwargs = {
+      enable_thinking: false,
+      ...template,
     };
   }
 
@@ -184,12 +199,7 @@ function responsesToChatCompletions(body) {
     tools: body.tools,
     tool_choice: body.tool_choice,
     parallel_tool_calls: body.parallel_tool_calls,
-    chat_template_kwargs:
-      body.model === "glm-5.1"
-        ? {
-          enable_thinking: true,
-        }
-        : undefined,
+    chat_template_kwargs: body.chat_template_kwargs,
   });
 }
 
@@ -437,6 +447,86 @@ function emitResponsesStreamFromChatStream(res, upstreamRes, requestId, startedA
   });
 }
 
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function requestUpstreamOnce(payload, apiKey, wantsStream, requestId, startedAt) {
+  return new Promise((resolve, reject) => {
+    const upstream = https.request(
+      {
+        hostname: TARGET_HOST,
+        path: TARGET_PATH,
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+          Accept: wantsStream ? "text/event-stream" : "application/json",
+        },
+      },
+      (upstreamRes) => {
+        log("upstream-response-start", {
+          requestId,
+          status: upstreamRes.statusCode,
+          contentType: upstreamRes.headers["content-type"],
+          durationMs: durationMs(startedAt),
+        });
+
+        if (wantsStream && (upstreamRes.statusCode || 500) < 400) {
+          resolve({ type: "stream", upstreamRes });
+          return;
+        }
+
+        const chunks = [];
+        upstreamRes.on("data", (chunk) => chunks.push(chunk));
+        upstreamRes.on("end", () => {
+          const rawResponse = Buffer.concat(chunks);
+          const text = rawResponse.toString("utf8");
+          resolve({
+            type: (upstreamRes.statusCode || 500) >= 400 ? "error" : "json",
+            retryable: (upstreamRes.statusCode || 500) >= 500,
+            upstreamRes,
+            rawResponse,
+            text,
+          });
+        });
+      }
+    );
+
+    upstream.on("error", reject);
+    upstream.write(payload);
+    upstream.end();
+  });
+}
+
+async function requestUpstreamWithRetry(payload, apiKey, wantsStream, requestId, startedAt) {
+  let lastError;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const result = await requestUpstreamOnce(payload, apiKey, wantsStream, requestId, startedAt);
+      if (result.retryable && attempt < 3) {
+        log("upstream-retryable-status", {
+          requestId,
+          attempt,
+          status: result.upstreamRes.statusCode,
+          bodyPreview: preview(result.text, 1000),
+        });
+        await delay(500 * attempt);
+        continue;
+      }
+      return result;
+    } catch (error) {
+      lastError = error;
+      if (attempt >= 3) {
+        break;
+      }
+      log("upstream-retryable-error", { requestId, attempt, error });
+      await delay(500 * attempt);
+    }
+  }
+  throw lastError;
+}
+
 function writeJson(res, status, payload) {
   const data = JSON.stringify(payload);
   res.writeHead(status, {
@@ -449,8 +539,23 @@ function writeJson(res, status, payload) {
 const server = http.createServer((req, res) => {
   const requestId = makeRequestId("cb");
   const startedAt = Date.now();
-  if (req.method !== "POST" || (req.url !== "/v1/chat/completions" && req.url !== "/v1/responses")) {
-    log("not-found", { requestId, method: req.method, url: req.url });
+  const pathName = new URL(req.url || "/", `http://127.0.0.1:${PORT}`).pathname;
+  if (req.method === "GET" && pathName === "/health") {
+    writeJson(res, 200, { ok: true, models: ["glm-5.1", "deepseek-v4-pro"] });
+    return;
+  }
+  if (req.method === "GET" && pathName === "/v1/models") {
+    writeJson(res, 200, {
+      object: "list",
+      data: [
+        { id: "glm-5.1", object: "model", created: 0, owned_by: "sztu" },
+        { id: "deepseek-v4-pro", object: "model", created: 0, owned_by: "sztu" },
+      ],
+    });
+    return;
+  }
+  if (req.method !== "POST" || (pathName !== "/v1/chat/completions" && pathName !== "/v1/responses")) {
+    log("not-found", { requestId, method: req.method, url: req.url, pathName });
     writeJson(res, 404, { error: "not found" });
     return;
   }
@@ -469,7 +574,7 @@ const server = http.createServer((req, res) => {
       return;
     }
 
-    const isResponsesApi = req.url === "/v1/responses";
+    const isResponsesApi = pathName === "/v1/responses";
     const nextBody = isResponsesApi ? responsesToChatCompletions(body) : sanitizeBody(body);
     const wantsStream = nextBody.stream === true;
     const upstreamBody = nextBody;
@@ -491,117 +596,106 @@ const server = http.createServer((req, res) => {
       upstreamBytes: Buffer.byteLength(payload),
     });
 
-    const upstream = https.request(
-      {
-        hostname: TARGET_HOST,
-        path: TARGET_PATH,
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          "Content-Type": "application/json",
-          Accept: "text/event-stream, application/json",
-        },
-      },
-      (upstreamRes) => {
-        log("upstream-response-start", {
-          requestId,
-          status: upstreamRes.statusCode,
-          contentType: upstreamRes.headers["content-type"],
-          durationMs: durationMs(startedAt),
-        });
-        if (wantsStream && (upstreamRes.statusCode || 500) < 400) {
+    requestUpstreamWithRetry(payload, apiKey, wantsStream, requestId, startedAt)
+      .then((result) => {
+        if (result.type === "stream") {
           if (isResponsesApi) {
-            emitResponsesStreamFromChatStream(res, upstreamRes, requestId, startedAt);
+            emitResponsesStreamFromChatStream(res, result.upstreamRes, requestId, startedAt);
           } else {
-            forwardChatCompletionStream(res, upstreamRes, requestId, startedAt);
+            forwardChatCompletionStream(res, result.upstreamRes, requestId, startedAt);
           }
           return;
         }
 
-        const chunks = [];
+        if (result.type === "error") {
+          const status = result.upstreamRes.statusCode || 502;
+          log("upstream-error-response", {
+            requestId,
+            status,
+            bodyPreview: preview(result.text, 2000),
+            durationMs: durationMs(startedAt),
+          });
+          res.writeHead(status, {
+            "Content-Type": "application/json; charset=utf-8",
+          });
+          res.end(result.text);
+          return;
+        }
 
-        upstreamRes.on("data", (chunk) => chunks.push(chunk));
-        upstreamRes.on("end", () => {
-          const rawResponse = Buffer.concat(chunks);
-          const text = rawResponse.toString("utf8");
+        try {
+          const parsed = JSON.parse(result.text);
+          log("response", {
+            requestId,
+            status: result.upstreamRes.statusCode,
+            bytes: result.rawResponse.length,
+            usage: parsed?.usage,
+            choices: Array.isArray(parsed?.choices) ? parsed.choices.length : undefined,
+            finishReason: parsed?.choices?.[0]?.finish_reason,
+            durationMs: durationMs(startedAt),
+          });
+          if (!isResponsesApi) {
+            const headers = {
+              "Content-Type": result.upstreamRes.headers["content-type"] || "application/json; charset=utf-8",
+              "Cache-Control": result.upstreamRes.headers["cache-control"] || "no-cache",
+              Connection: "keep-alive",
+            };
 
-          if ((upstreamRes.statusCode || 500) >= 400) {
-            log("upstream-error-response", {
-              requestId,
-              status: upstreamRes.statusCode,
-              bodyPreview: preview(text, 2000),
-              durationMs: durationMs(startedAt),
-            });
-            res.writeHead(upstreamRes.statusCode || 502, {
-              "Content-Type": "application/json; charset=utf-8",
-            });
-            res.end(text);
+            res.writeHead(result.upstreamRes.statusCode || 200, headers);
+            res.end(result.rawResponse);
             return;
           }
 
-          try {
-            const payload = JSON.parse(text);
-            log("response", {
-              requestId,
-              status: upstreamRes.statusCode,
-              bytes: rawResponse.length,
-              usage: payload?.usage,
-              choices: Array.isArray(payload?.choices) ? payload.choices.length : undefined,
-              finishReason: payload?.choices?.[0]?.finish_reason,
-              durationMs: durationMs(startedAt),
-            });
-            if (!isResponsesApi) {
-              const headers = {
-                "Content-Type": upstreamRes.headers["content-type"] || "application/json; charset=utf-8",
-                "Cache-Control": upstreamRes.headers["cache-control"] || "no-cache",
-                Connection: "keep-alive",
-              };
-
-              res.writeHead(upstreamRes.statusCode || 200, headers);
-              res.end(rawResponse);
-              return;
-            }
-
-            writeJson(res, upstreamRes.statusCode || 200, chatCompletionsToResponses(payload));
-          } catch (error) {
-            log("invalid-upstream-json", { requestId, error, bodyPreview: preview(text, 4000) });
-            writeJson(res, 502, { error: "invalid upstream json" });
-          }
-        });
-      }
-    );
-
-    upstream.on("error", (error) => {
-      log("upstream-error", { requestId, durationMs: durationMs(startedAt), error });
-      if (!res.headersSent) {
-        writeJson(res, 502, { error: String(error) });
-        return;
-      }
-      res.end();
-    });
-
-    upstream.write(payload);
-    upstream.end();
+          writeJson(res, result.upstreamRes.statusCode || 200, chatCompletionsToResponses(parsed));
+        } catch (error) {
+          log("invalid-upstream-json", { requestId, error, bodyPreview: preview(result.text, 4000) });
+          writeJson(res, 502, { error: "invalid upstream json" });
+        }
+      })
+      .catch((error) => {
+        log("upstream-error", { requestId, durationMs: durationMs(startedAt), error });
+        if (!res.headersSent) {
+          writeJson(res, 502, { error: String(error) });
+          return;
+        }
+        res.end();
+      });
   });
 });
 
-server.listen(PORT, "127.0.0.1", () => {
-  fs.writeFileSync(PID_PATH, String(process.pid), "utf8");
-  log("listening", { host: "127.0.0.1", port: PORT });
-});
+function startServer() {
+  server.listen(PORT, "127.0.0.1", () => {
+    fs.writeFileSync(PID_PATH, String(process.pid), "utf8");
+    log("listening", { host: "127.0.0.1", port: PORT });
+  });
 
-server.on("error", (error) => {
-  log("server-error", { error });
-});
+  server.on("error", (error) => {
+    log("server-error", { error });
+  });
 
-process.on("SIGINT", () => cleanupAndExit("SIGINT"));
-process.on("SIGTERM", () => cleanupAndExit("SIGTERM"));
-process.on("exit", () => {
-  try {
-    if (fs.existsSync(PID_PATH) && fs.readFileSync(PID_PATH, "utf8").trim() === String(process.pid)) {
-      fs.unlinkSync(PID_PATH);
+  process.on("SIGINT", () => cleanupAndExit("SIGINT"));
+  process.on("SIGTERM", () => cleanupAndExit("SIGTERM"));
+  process.on("exit", () => {
+    try {
+      if (fs.existsSync(PID_PATH) && fs.readFileSync(PID_PATH, "utf8").trim() === String(process.pid)) {
+        fs.unlinkSync(PID_PATH);
+      }
+    } catch (error) {
+      log("pid-exit-cleanup-error", { error });
     }
-  } catch (error) {
-    log("pid-exit-cleanup-error", { error });
-  }
-});
+  });
+}
+
+if (require.main === module) {
+  startServer();
+}
+
+module.exports = {
+  chatCompletionsToResponses,
+  emitResponsesStreamFromChatStream,
+  normalizeBody: sanitizeBody,
+  normalizeMaxTokens,
+  normalizeModel,
+  responsesToChatCompletions,
+  sanitizeBody,
+  startServer,
+};

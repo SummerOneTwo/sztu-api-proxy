@@ -50,6 +50,18 @@ node .\codebuddy\codebuddy-proxy.js
 
 Runtime logs and PID files are written under each proxy's `.runtime` folder.
 
+## Switchboard
+
+Use the local control console to manage proxy processes, status, logs, `.env`
+settings, recommended client snippets, and Windows autostart:
+
+```powershell
+node .\scripts\sztu-switch.js serve
+```
+
+The dashboard runs at `http://127.0.0.1:8795` by default. See
+[switchboard/README.md](switchboard/README.md) for the command list.
+
 ## Tests
 
 Run direct SZTU API checks:

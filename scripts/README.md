@@ -45,6 +45,26 @@ Parser-only check for Claude Code tool-call formats:
 node .\scripts\test-tool-parser.js
 ```
 
+Claude Code proxy helper regression check:
+
+```powershell
+node .\scripts\test-claudecode-proxy.js
+```
+
+Switchboard dashboard and CLI:
+
+```powershell
+node .\scripts\sztu-switch.js serve
+node .\scripts\sztu-switch.js status
+node .\scripts\sztu-switch.js autostart on opencode codebuddy
+```
+
+Switchboard helper check:
+
+```powershell
+node .\scripts\test-switchboard.js
+```
+
 The Claude Code suite checks:
 
 - health endpoint

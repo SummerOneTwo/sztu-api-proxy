@@ -39,6 +39,32 @@ function readRequestJson(req) {
   });
 }
 
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function fetchWithRetry(url, options, requestId) {
+  let lastError;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const response = await fetch(url, options);
+      if (response.status < 500 || attempt === 3) {
+        return response;
+      }
+      const text = await response.text().catch(() => "");
+      log("upstream-retryable-status", { requestId, attempt, status: response.status, bodyPreview: preview(text, 1000) });
+    } catch (error) {
+      lastError = error;
+      if (attempt === 3) {
+        break;
+      }
+      log("upstream-retryable-error", { requestId, attempt, error });
+    }
+    await delay(500 * attempt);
+  }
+  throw lastError;
+}
+
 function normalizeMaxTokens(value) {
   const number = Number(value);
   if (!Number.isFinite(number) || number <= 0) {
@@ -88,14 +114,16 @@ function normalizeMessage(message) {
   if (typeof message?.tool_call_id === "string") {
     next.tool_call_id = message.tool_call_id;
   }
-  if (Array.isArray(message?.tool_calls) && message.tool_calls.length > 0) {
-    next.tool_calls = message.tool_calls;
-  }
   if (Object.prototype.hasOwnProperty.call(message || {}, "content")) {
     next.content = Array.isArray(message.content) ? flattenContent(message.content) : message.content;
     if (next.content && typeof next.content === "object") {
       next.content = JSON.stringify(next.content);
     }
+  }
+  if (next.role === "tool") {
+    next.role = "user";
+    next.content = `Tool result${next.tool_call_id ? ` ${next.tool_call_id}` : ""}:\n${next.content == null ? "" : next.content}`;
+    delete next.tool_call_id;
   }
   if (next.role === "tool" && typeof next.content !== "string") {
     next.content = next.content == null ? "" : JSON.stringify(next.content);
@@ -223,7 +251,7 @@ function proxyRequest(req, res, body) {
     upstreamBytes: Buffer.byteLength(payload),
   });
 
-  fetch(`https://${UPSTREAM_HOST}${UPSTREAM_PATH}`, {
+  fetchWithRetry(`https://${UPSTREAM_HOST}${UPSTREAM_PATH}`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${apiKey}`,
@@ -231,7 +259,7 @@ function proxyRequest(req, res, body) {
       Accept: upstreamBody.stream === true ? "text/event-stream" : "application/json",
     },
     body: payload,
-  })
+  }, requestId)
     .then(async (upstreamRes) => {
       const contentType = upstreamRes.headers.get("content-type") || "";
       log("upstream-response-start", {
@@ -240,6 +268,25 @@ function proxyRequest(req, res, body) {
         contentType,
         durationMs: durationMs(startedAt),
       });
+
+      if (!upstreamRes.ok) {
+        const text = await upstreamRes.text().catch(() => "");
+        log("upstream-error-response", {
+          requestId,
+          status: upstreamRes.status,
+          durationMs: durationMs(startedAt),
+          bodyPreview: preview(text, 1000),
+        });
+        writeJson(res, upstreamRes.status, {
+          error: {
+            message: text.slice(0, 1000) || `upstream returned ${upstreamRes.status}`,
+            type: "upstream_error",
+            status: upstreamRes.status,
+          },
+        });
+        return;
+      }
+
       res.writeHead(upstreamRes.status, {
         "Content-Type":
           upstreamBody.stream === true

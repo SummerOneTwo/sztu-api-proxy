@@ -1,3 +1,5 @@
+const fs = require("fs");
+
 const COMMON_REQUIRED = {
   Read: ["file_path"],
   Grep: ["pattern"],
@@ -13,8 +15,21 @@ function parseToolCallText(text, allowedTools) {
 }
 
 function parseToolCallDetailed(text, allowedTools) {
+  const result = parseToolCallsDetailed(text, allowedTools);
+  return {
+    tool: result.tools[0] || null,
+    candidates: result.candidates,
+    rejected: result.rejected,
+    reason: result.reason,
+    matchedFormat: result.matchedFormat,
+    rawInputKeys: result.rawInputKeys,
+    strippedKeys: result.strippedKeys,
+  };
+}
+
+function parseToolCallsDetailed(text, allowedTools) {
   if (typeof text !== "string" || !text.trim()) {
-    return { tool: null, candidates: 0, rejected: [], reason: "empty" };
+    return { tools: [], candidates: 0, rejected: [], reason: "empty" };
   }
 
   const tools = normalizeAllowedTools(allowedTools);
@@ -22,29 +37,43 @@ function parseToolCallDetailed(text, allowedTools) {
   const searchable = removeCodeFences(normalized);
   const candidates = extractCandidates(searchable, tools);
   const rejected = [];
+  const parsedResults = [];
+  const acceptedRaw = [];
 
   for (const candidate of candidates) {
-    const parsed = parseCandidate(candidate, tools);
-    const finalized = finalizeTool(parsed, tools);
-    if (finalized) {
-      return {
-        tool: finalized.tool,
-        candidates: candidates.length,
-        rejected,
-        matchedFormat: candidate.format,
-        rawInputKeys: finalized.rawInputKeys,
-        strippedKeys: finalized.strippedKeys,
-      };
+    if (acceptedRaw.some((raw) => raw.includes(candidate.raw) || candidate.raw.includes(raw))) {
+      continue;
     }
-    rejected.push({
-      format: candidate.format,
-      name: parsed?.name,
-      inputKeys: parsed?.input && typeof parsed.input === "object" ? Object.keys(parsed.input) : [],
-    });
+    const parsedList = asArray(parseCandidate(candidate, tools));
+    for (const parsed of parsedList) {
+      const finalized = finalizeTool(parsed, tools);
+      if (finalized) {
+        parsedResults.push({ ...finalized, matchedFormat: candidate.format });
+        acceptedRaw.push(candidate.raw);
+        continue;
+      }
+      rejected.push({
+        format: candidate.format,
+        name: parsed?.name,
+        inputKeys: parsed?.input && typeof parsed.input === "object" ? Object.keys(parsed.input) : [],
+      });
+    }
+  }
+
+  if (parsedResults.length > 0) {
+    const first = parsedResults[0];
+    return {
+      tools: parsedResults.map((result) => result.tool),
+      candidates: candidates.length,
+      rejected,
+      matchedFormat: first.matchedFormat,
+      rawInputKeys: first.rawInputKeys,
+      strippedKeys: first.strippedKeys,
+    };
   }
 
   return {
-    tool: null,
+    tools: [],
     candidates: candidates.length,
     rejected,
     reason: candidates.length ? "no-valid-candidate" : "no-candidate",
@@ -55,6 +84,8 @@ function extractCandidates(text, tools) {
   return [
     ...extractDeepSeekTagCandidates(text),
     ...extractToolUseCandidates(text),
+    ...extractInvokeCandidates(text),
+    ...extractUnnamedParameterCandidates(text),
     ...extractToolCallsInlineCandidates(text, tools),
     ...extractNamedXmlCandidates(text),
     ...extractToolXmlCandidates(text),
@@ -87,6 +118,26 @@ function extractToolUseCandidates(text) {
   return candidates;
 }
 
+function extractInvokeCandidates(text) {
+  const candidates = [];
+  const callRe = /<invoke\s+name=["']?([A-Za-z0-9_-]+)["']?[^>]*>\s*([\s\S]*?)(?=<\/invoke>|<\/tool[-_]call>|<\/tool>|<invoke\b|$)/gi;
+  for (const match of text.matchAll(callRe)) {
+    candidates.push({ format: "invoke-xml", name: match[1], inputText: match[2], raw: match[0] });
+  }
+  return candidates;
+}
+
+function extractUnnamedParameterCandidates(text) {
+  const candidates = [];
+  const callRe = /<tool[-_]call>\s*([\s\S]*?)(?=<\/tool[-_]call>|<\/tool>|<tool[-_]call>|$)/gi;
+  for (const match of text.matchAll(callRe)) {
+    if (/<parameter\b/i.test(match[1]) && !/<invoke\b/i.test(match[1])) {
+      candidates.push({ format: "unnamed-parameter-xml", inputText: match[1], raw: match[0] });
+    }
+  }
+  return candidates;
+}
+
 function extractToolCallsInlineCandidates(text, tools) {
   const candidates = [];
   const names = toolNamesPattern(tools);
@@ -104,7 +155,7 @@ function extractToolCallsInlineCandidates(text, tools) {
 
 function extractNamedXmlCandidates(text) {
   const candidates = [];
-  const callRe = /<tool_call\s+name=["']?([A-Za-z0-9_-]+)["']?>\s*([\s\S]*?)(?=<\/tool_call>|<\/think>|<tool_call\b|$)/gi;
+  const callRe = /<tool[-_]call\s+name=["']?([A-Za-z0-9_-]+)["']?[^>]*>\s*([\s\S]*?)(?=<\/tool[-_]call>|<\/think>|<tool[-_]call\b|$)/gi;
   for (const match of text.matchAll(callRe)) {
     candidates.push({ format: "named-xml", name: match[1], inputText: match[2], raw: match[0] });
   }
@@ -122,7 +173,7 @@ function extractToolXmlCandidates(text) {
 
 function extractArgKeyCandidates(text) {
   const candidates = [];
-  const callRe = /<tool_call>\s*([A-Za-z0-9_-]+)\s*([\s\S]*?)(?=<\/tool_call>|<\/think>|<tool_call>|$)/gi;
+  const callRe = /<tool[-_]call>\s*([A-Za-z0-9_-]+)\s*([\s\S]*?)(?=<\/tool[-_]call>|<\/think>|<tool[-_]call>|$)/gi;
   for (const match of text.matchAll(callRe)) {
     if (/<arg_key\b/i.test(match[2])) {
       candidates.push({ format: "arg-key-xml", name: match[1], inputText: match[2], raw: match[0] });
@@ -134,7 +185,7 @@ function extractArgKeyCandidates(text) {
 function extractToolCallBlockCandidates(text, tools) {
   const candidates = [];
   const names = toolNamesPattern(tools);
-  const callRe = new RegExp(`<tool_call>\\s*(${names})\\s*([\\s\\S]*?)(?=<\\/tool_call>|<\\/think>|<tool_call>|$)`, "gi");
+  const callRe = new RegExp(`<tool[-_]call>\\s*(${names})\\s*([\\s\\S]*?)(?=<\\/tool[-_]call>|<\\/think>|<tool[-_]call>|$)`, "gi");
   for (const match of text.matchAll(callRe)) {
     if (!/<arg_key\b|<parameter\b/i.test(match[2])) {
       candidates.push({ format: "broken-tool-call", name: canonicalToolName(match[1], tools), inputText: match[2], raw: match[0] });
@@ -178,7 +229,7 @@ function extractToolColonJsonCandidates(text, tools) {
 
 function extractJsonCandidates(text) {
   const candidates = [];
-  const envelopeRe = /<\|?tool_calls?\|?>\s*([\s\S]*?)\s*(?:<\/\|?tool_calls?\|?>|<\/think>|$)|<tool_call>\s*([\s\S]*?)\s*(?:<\/tool_call>|<\/think>|$)/gi;
+  const envelopeRe = /<\|?tool_calls?\|?>\s*([\s\S]*?)\s*(?:<\/\|?tool_calls?\|?>|<\/think>|$)|<tool[-_]call>\s*([\s\S]*?)\s*(?:<\/tool[-_]call>|<\/think>|$)/gi;
   for (const match of text.matchAll(envelopeRe)) {
     const inputText = match[1] || match[2] || "";
     if (inputText.includes("{")) {
@@ -250,10 +301,17 @@ function parseCandidate(candidate) {
       input: parsed.input && typeof parsed.input === "object" ? parsed.input : parsed,
     };
   }
-  if (candidate.format === "parameter-xml" || candidate.format === "tool-use-xml") {
+  if (candidate.format === "parameter-xml" || candidate.format === "tool-use-xml" || candidate.format === "invoke-xml") {
     return {
       name: candidate.name,
       input: parseParameterXml(candidate.inputText),
+    };
+  }
+  if (candidate.format === "unnamed-parameter-xml") {
+    const input = parseParameterXml(candidate.inputText);
+    return {
+      name: inferToolNameFromInput(input),
+      input,
     };
   }
   if (candidate.format === "named-xml" || candidate.format === "broken-tool-call") {
@@ -278,6 +336,13 @@ function parseCandidate(candidate) {
     name: candidate.name,
     input: parseInputText(candidate.inputText),
   };
+}
+
+function asArray(value) {
+  if (!value) {
+    return [];
+  }
+  return Array.isArray(value) ? value : [value];
 }
 
 function parseInlineToolBody(name, inputText) {
@@ -308,11 +373,24 @@ function parseInlineToolBody(name, inputText) {
 }
 
 function parseJsonToolCandidate(text) {
-  const jsonText = extractFirstJsonObject(text);
+  const jsonText = extractFirstJsonValue(text);
   if (!jsonText) {
     return null;
   }
   const parsed = parseLooseJson(jsonText);
+  if (Array.isArray(parsed)) {
+    return parsed
+      .map((item) => {
+        if (!item || typeof item.name !== "string") {
+          return null;
+        }
+        return {
+          name: item.name,
+          input: item.input && typeof item.input === "object" ? item.input : {},
+        };
+      })
+      .filter(Boolean);
+  }
   const item = Array.isArray(parsed) ? parsed[0] : parsed;
   if (!item || typeof item.name !== "string") {
     return null;
@@ -336,9 +414,9 @@ function parseInputText(text) {
 
 function parseParameterXml(text) {
   const input = {};
-  const params = text.matchAll(/<parameter\s+name=["']?([^"'>\s]+)["']?>\s*([\s\S]*?)\s*<\/parameter>/gi);
+  const params = text.matchAll(/<parameter\b[^>]*\bname=["']?([^"'>\s]+)["']?[^>]*>\s*([\s\S]*?)\s*<\/parameter>/gi);
   for (const param of params) {
-    input[param[1]] = param[2].trim();
+    input[param[1]] = decodeXmlEntities(param[2].trim());
   }
   return input;
 }
@@ -347,7 +425,7 @@ function parseChildElementXml(text) {
   const input = {};
   const tags = text.matchAll(/<([A-Za-z_][A-Za-z0-9_-]*)\s*>\s*([\s\S]*?)\s*<\/\1\s*>/gi);
   for (const tag of tags) {
-    input[tag[1]] = tag[2].trim();
+    input[tag[1]] = decodeXmlEntities(tag[2].trim());
   }
   return input;
 }
@@ -359,6 +437,12 @@ function parseNamedXmlInput(text) {
   }
   if (/<parameter\s+name=/i.test(source)) {
     return parseParameterXml(source);
+  }
+  if (source.includes("{")) {
+    const input = parseInputText(source);
+    if (Object.keys(input).length > 0) {
+      return input;
+    }
   }
   const childInput = parseChildElementXml(source);
   if (Object.keys(childInput).length > 0) {
@@ -378,6 +462,28 @@ function parseArgKeyXml(text) {
     Object.assign(input, parseKeyValues(pair[1].replace(/^([A-Za-z_][A-Za-z0-9_]*)["']\s*:/, "$1:")));
   }
   return input;
+}
+
+function inferToolNameFromInput(input) {
+  if (!input || typeof input !== "object") {
+    return "";
+  }
+  if (input.command !== undefined) {
+    return "Bash";
+  }
+  if (input.file_path !== undefined && input.content !== undefined) {
+    return "Write";
+  }
+  if (input.file_path !== undefined && input.old_string !== undefined && input.new_string !== undefined) {
+    return "Edit";
+  }
+  if (input.file_path !== undefined) {
+    return "Read";
+  }
+  if (input.pattern !== undefined) {
+    return "Glob";
+  }
+  return "";
 }
 
 function parseKeyValues(text) {
@@ -403,13 +509,25 @@ function finalizeTool(parsed, tools) {
     return null;
   }
 
-  const name = canonicalToolName(parsed.name, tools);
-  const allowed = tools?.get(name.toLowerCase());
+  let name = canonicalToolName(parsed.name, tools);
+  let allowed = tools?.get(name.toLowerCase());
   if (tools && !allowed) {
-    return null;
+    if (name === "Write" && tools.has("edit")) {
+      name = canonicalToolName("Edit", tools);
+      allowed = tools.get(name.toLowerCase());
+    } else {
+      return null;
+    }
   }
 
   const input = parsed.input && typeof parsed.input === "object" ? { ...parsed.input } : {};
+  if (name === "Edit" && input.content !== undefined && input.new_string === undefined) {
+    input.new_string = input.content;
+    if (input.old_string === undefined) {
+      input.old_string = existingFileContent(input.file_path) ?? "";
+    }
+    delete input.content;
+  }
   for (const [key, value] of Object.entries(input)) {
     if (typeof value === "string") {
       input[key] = normalizeInputValue(value);
@@ -426,8 +544,28 @@ function finalizeTool(parsed, tools) {
       }
     }
   }
+  if (name === "Edit" && input.old_string === "" && typeof input.new_string === "string" && input.file_path) {
+    const writeName = canonicalToolName("Write", tools);
+    const writeAllowed = !tools || tools.has(writeName.toLowerCase());
+    if (writeAllowed) {
+      return {
+        tool: {
+          type: "tool_use",
+          id: `toolu_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
+          name: writeName,
+          input: {
+            file_path: input.file_path,
+            content: input.new_string,
+          },
+        },
+        rawInputKeys,
+        strippedKeys,
+      };
+    }
+    input.old_string = existingFileContent(input.file_path) ?? input.old_string;
+  }
   const required = allowed?.required || COMMON_REQUIRED[name] || [];
-  if (required.some((key) => input[key] === undefined || input[key] === "")) {
+  if (required.some((key) => input[key] === undefined || (input[key] === "" && !(name === "Edit" && key === "old_string")))) {
     return null;
   }
   if (name === "Bash" && typeof input.command === "string" && hasUnbalancedQuotes(input.command)) {
@@ -444,6 +582,31 @@ function finalizeTool(parsed, tools) {
     rawInputKeys,
     strippedKeys,
   };
+}
+
+function parseToolCallsText(text, allowedTools) {
+  return parseToolCallsDetailed(text, allowedTools).tools;
+}
+
+function existingFileContent(filePath) {
+  if (typeof filePath !== "string" || !filePath) {
+    return null;
+  }
+  try {
+    if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
+      return fs.readFileSync(filePath, "utf8");
+    }
+  } catch {}
+  return null;
+}
+
+function decodeXmlEntities(text) {
+  return String(text || "")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, "&");
 }
 
 function normalizeAllowedTools(allowedTools) {
@@ -572,13 +735,27 @@ function parseLooseJson(text) {
 }
 
 function extractFirstJsonObject(text) {
+  const value = extractFirstJsonValue(text);
+  return value && value.startsWith("{") ? value : null;
+}
+
+function extractFirstJsonValue(text) {
   if (typeof text !== "string") {
     return null;
   }
-  const start = text.indexOf("{");
+  const objectStart = text.indexOf("{");
+  const arrayStart = text.indexOf("[");
+  let start = -1;
+  if (objectStart >= 0 && arrayStart >= 0) {
+    start = Math.min(objectStart, arrayStart);
+  } else {
+    start = Math.max(objectStart, arrayStart);
+  }
   if (start < 0) {
     return null;
   }
+  const open = text[start];
+  const close = open === "{" ? "}" : "]";
   let depth = 0;
   let inString = false;
   let escaped = false;
@@ -599,9 +776,9 @@ function extractFirstJsonObject(text) {
     if (inString) {
       continue;
     }
-    if (char === "{") {
+    if (char === open) {
       depth++;
-    } else if (char === "}") {
+    } else if (char === close) {
       depth--;
       if (depth === 0) {
         return text.slice(start, index + 1);
@@ -611,4 +788,4 @@ function extractFirstJsonObject(text) {
   return null;
 }
 
-module.exports = { parseToolCallDetailed, parseToolCallText };
+module.exports = { parseToolCallDetailed, parseToolCallText, parseToolCallsDetailed, parseToolCallsText };

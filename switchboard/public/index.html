@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>SZTU Switchboard</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="app-sidebar">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 64 64" role="img" aria-label="">
+              <path d="M12 22h40M12 32h24M12 42h32" />
+              <path d="M43 18l9 14-9 14" />
+              <circle cx="18" cy="22" r="3" />
+              <circle cx="28" cy="32" r="3" />
+              <circle cx="36" cy="42" r="3" />
+            </svg>
+          </div>
+          <div>
+            <h1>SZTU</h1>
+            <p>Switchboard</p>
+          </div>
+        </div>
+
+        <section class="sidebar-section">
+          <div class="section-label">代理</div>
+          <div id="serviceMenu" class="service-menu"></div>
+        </section>
+
+        <section class="sidebar-section">
+          <div class="section-label">运行摘要</div>
+          <div class="sidebar-metrics">
+            <div><span>服务</span><strong id="metricTotal">0</strong></div>
+            <div><span>运行</span><strong id="metricRunning">0</strong></div>
+            <div><span>健康</span><strong id="metricHealthy">0</strong></div>
+            <div><span>自启</span><strong id="metricAutostart">关</strong></div>
+          </div>
+        </section>
+
+        <section class="sidebar-section">
+          <div class="section-label">系统</div>
+          <button id="refreshBtn" class="sidebar-button">刷新状态</button>
+          <a class="sidebar-link" href="/api/state" target="_blank" rel="noreferrer">原始状态 JSON</a>
+        </section>
+      </aside>
+
+      <main class="workspace">
+        <header class="workspace-header">
+          <div>
+            <h2 id="selectedServiceTitle">代理状态</h2>
+            <p id="selectedServiceSubtitle">选择左侧代理查看详情。</p>
+          </div>
+          <div class="workspace-actions">
+            <span id="selectedServiceBadge" class="badge">none</span>
+            <button id="selectedServiceAction" class="primary-action" disabled>启动</button>
+          </div>
+        </header>
+
+        <section class="detail-grid">
+          <article class="panel service-detail">
+            <div class="panel-header">
+              <div>
+                <h3>状态</h3>
+                <p id="selectedServiceMeta">-</p>
+              </div>
+            </div>
+            <div id="selectedServiceHint" class="detail-hint">-</div>
+            <details class="health-details">
+              <summary>查看健康检查响应</summary>
+              <pre id="selectedServiceHealth" class="health-output"></pre>
+            </details>
+          </article>
+
+          <article class="panel autostart-panel">
+            <div class="panel-header">
+              <div>
+                <h3>开机自启</h3>
+                <p>登录 Windows 后自动启动所选代理。</p>
+              </div>
+              <label class="switch">
+                <input id="autostartToggle" type="checkbox" />
+                <span></span>
+              </label>
+            </div>
+            <div id="autostartState"></div>
+            <div id="autostartList" class="autostart-list"></div>
+            <div class="button-row">
+              <button id="saveAutostartBtn" class="secondary-action">保存自启</button>
+              <button id="runAutostartBtn" class="secondary-action">立即执行</button>
+            </div>
+          </article>
+        </section>
+
+        <section class="panel env-panel">
+          <div class="panel-header">
+            <div>
+              <h3>环境变量</h3>
+              <p>直接修改仓库根目录 `.env`。端口或模型变更后需要重启对应代理。</p>
+            </div>
+            <button id="saveEnvBtn" class="primary-action small">保存 .env</button>
+          </div>
+          <div id="envForm" class="env-form"></div>
+        </section>
+
+        <section class="panel config-panel">
+          <div class="panel-header">
+            <div>
+              <h3>接入配置</h3>
+              <p>推荐地址、模型和完整配置片段。</p>
+            </div>
+          </div>
+          <div id="configList" class="config-list"></div>
+        </section>
+
+        <section class="panel log-panel">
+          <div class="panel-header">
+            <div>
+              <h3>日志</h3>
+              <p>最近运行记录。</p>
+            </div>
+            <div class="log-controls">
+              <select id="logService"></select>
+              <button id="loadLogsBtn" class="secondary-action">读取</button>
+            </div>
+          </div>
+          <pre id="logOutput" class="log-output">正在加载...</pre>
+        </section>
+      </main>
+
+      <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    </div>
+
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>

@@ -1,5 +1,6 @@
 const assert = require("assert");
-const { parseToolCallDetailed, parseToolCallText } = require("../claudecode/tool-parser");
+const path = require("path");
+const { parseToolCallDetailed, parseToolCallText, parseToolCallsText } = require("../claudecode/tool-parser");
 
 const tools = [
   {
@@ -135,6 +136,16 @@ const cases = [
     expect: { name: "Read", input: { file_path: "README.md" } },
   },
   {
+    name: "deepseek tool-call hyphen read with typed parameter",
+    text: `<tool-call name="Read"> <parameter name="file_path" string="true">${winPath}</parameter> </parameter> </tool-call>`,
+    expect: { name: "Read", input: { file_path: winPath } },
+  },
+  {
+    name: "unnamed tool call inferred bash parameter",
+    text: `<tool_call><parameter name="command">"node --version"</parameter><parameter name="description">Check Node</parameter></tool_call>`,
+    expect: { name: "Bash", input: { command: "node --version" } },
+  },
+  {
     name: "deepseek tool colon json one line",
     text: `Tool: Read Tool: {"file_path": "${winPath.replace(/\\/g, "\\\\")}"}`,
     expect: { name: "Read", input: { file_path: winPath } },
@@ -188,6 +199,125 @@ for (const testCase of cases) {
   assert.strictEqual(parsed.name, testCase.expect.name, `${testCase.name}: name`);
   assert.deepStrictEqual(parsed.input, testCase.expect.input, `${testCase.name}: input`);
 }
+
+const editTools = [
+  ...tools,
+  {
+    name: "Edit",
+    input_schema: {
+      type: "object",
+      required: ["file_path", "old_string", "new_string"],
+      properties: {
+        file_path: { type: "string" },
+        old_string: { type: "string" },
+        new_string: { type: "string" },
+      },
+    },
+  },
+  {
+    name: "Write",
+    input_schema: {
+      type: "object",
+      required: ["file_path", "content"],
+      properties: {
+        file_path: { type: "string" },
+        content: { type: "string" },
+      },
+    },
+  },
+];
+
+const editAsCreate = parseToolCallText(
+  `<tool_call name="Edit"> {"file_path":"demo-blog/new-index.html","old_string":"","new_string":"<!DOCTYPE html><html><head></head><body>Blog</body></html>"} </tool_call>`,
+  editTools,
+);
+assert(editAsCreate, "edit named xml with html body: expected a parsed tool call");
+assert.strictEqual(editAsCreate.name, "Write", "edit named xml with html body: should repair empty Edit to Write");
+assert.deepStrictEqual(editAsCreate.input, {
+  file_path: "demo-blog/new-index.html",
+  content: "<!DOCTYPE html><html><head></head><body>Blog</body></html>",
+});
+
+const editOnlyTools = editTools.filter((tool) => tool.name !== "Write");
+const writeAsEdit = parseToolCallText(
+  `<tool_call name="Write"> {"file_path":"demo-blog/new-index.html","content":"<!DOCTYPE html><html><head></head><body>Blog</body></html>"} </tool_call>`,
+  editOnlyTools,
+);
+assert(writeAsEdit, "write named xml with only Edit allowed: expected a parsed tool call");
+assert.strictEqual(writeAsEdit.name, "Edit", "write named xml with only Edit allowed: should repair Write to Edit");
+assert.deepStrictEqual(writeAsEdit.input, {
+  file_path: "demo-blog/new-index.html",
+  old_string: "",
+  new_string: "<!DOCTYPE html><html><head></head><body>Blog</body></html>",
+});
+
+const existingReadmePath = path.resolve(__dirname, "..", "README.md");
+const overwriteExistingAsEdit = parseToolCallText(
+  `<tool_call name="Write"> {"file_path":${JSON.stringify(existingReadmePath)},"content":"# Replacement"} </tool_call>`,
+  editOnlyTools,
+);
+assert(overwriteExistingAsEdit, "write existing file with only Edit allowed: expected a parsed tool call");
+assert.strictEqual(overwriteExistingAsEdit.name, "Edit", "write existing file with only Edit allowed: should repair Write to Edit");
+assert.strictEqual(overwriteExistingAsEdit.input.file_path, existingReadmePath);
+assert.strictEqual(overwriteExistingAsEdit.input.new_string, "# Replacement");
+assert(
+  overwriteExistingAsEdit.input.old_string.includes("# SZTU API Proxy"),
+  "write existing file with only Edit allowed: old_string should contain existing file contents",
+);
+
+const invokeWriteAsEdit = parseToolCallText(
+  `<tool_call><invoke name="Write"><parameter name="file_path" string="true">demo-blog/new-index.html</parameter><parameter name="content" string="true">&lt;!DOCTYPE html&gt;&lt;html&gt;&lt;head&gt;&lt;/head&gt;&lt;body&gt;Blog&lt;/body&gt;&lt;/html&gt;</parameter></invoke></tool>`,
+  editOnlyTools,
+);
+assert(invokeWriteAsEdit, "invoke write with only Edit allowed: expected a parsed tool call");
+assert.strictEqual(invokeWriteAsEdit.name, "Edit", "invoke write with only Edit allowed: should repair Write to Edit");
+assert.deepStrictEqual(invokeWriteAsEdit.input, {
+  file_path: "demo-blog/new-index.html",
+  old_string: "",
+  new_string: "<!DOCTYPE html><html><head></head><body>Blog</body></html>",
+});
+
+const repeatedNamedXmlTools = parseToolCallsText(
+  '<tool_call name="Read"><file_path>README.md</file_path></tool_call><tool_call name="Read"><file_path>CHANGELOG.md</file_path></tool_call>',
+  tools,
+);
+assert.strictEqual(repeatedNamedXmlTools.length, 2, "repeated named xml should parse both tool calls");
+assert.deepStrictEqual(repeatedNamedXmlTools.map((tool) => tool.input.file_path), ["README.md", "CHANGELOG.md"]);
+
+const inlineTools = parseToolCallsText(
+  '<tool-calls><tool_use id="x">Bash: tree -L 2</tool_use><tool_use id="y">Read: package.json</tool_use></tool-calls>',
+  tools,
+);
+assert.strictEqual(inlineTools.length, 2, "inline tool-calls should parse both tool calls");
+assert.deepStrictEqual(inlineTools.map((tool) => tool.name), ["Bash", "Read"]);
+assert.deepStrictEqual(inlineTools.map((tool) => tool.input), [{ command: "tree -L 2" }, { file_path: "package.json" }]);
+
+const jsonArrayTools = parseToolCallsText(
+  '<tool_call>[{"name":"Glob","input":{"pattern":"**/*.js"}},{"name":"Read","input":{"file_path":"README.md"}}]</tool_call>',
+  tools,
+);
+assert.strictEqual(jsonArrayTools.length, 2, "json array should parse both tool calls");
+assert.deepStrictEqual(jsonArrayTools.map((tool) => tool.name), ["Glob", "Read"]);
+
+const bashWithDescriptionTools = [
+  {
+    name: "Bash",
+    input_schema: {
+      type: "object",
+      required: ["command"],
+      properties: { command: { type: "string" }, description: { type: "string" } },
+    },
+  },
+];
+const bashWithDescription = parseToolCallText(
+  '<tool_call name="Bash"><command>find .</command><description>List files</description><limit>10</limit></tool_call>',
+  bashWithDescriptionTools,
+);
+assert.deepStrictEqual(
+  bashWithDescription.input,
+  { command: "find .", description: "List files" },
+  "schema-allowed optional parameters should be preserved while unknown fields are stripped",
+);
 
 const misses = [
   {

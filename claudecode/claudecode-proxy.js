@@ -3,7 +3,7 @@ const fs = require("fs");
 const path = require("path");
 const { getApiKey, envNumber, loadDotEnv } = require("../shared/env");
 const { createLogger, durationMs, makeRequestId, preview, summarizeAnthropicBody, summarizeBody } = require("../shared/logger");
-const { parseToolCallDetailed } = require("./tool-parser");
+const { parseToolCallsDetailed } = require("./tool-parser");
 
 loadDotEnv();
 
@@ -195,7 +195,7 @@ function anthropicMessagesToOpenAI(body) {
         for (const part of toolResults) {
           messages.push({
             role: "user",
-            content: `Tool result:\n${contentToText(part.content)}\n\nAnswer the user's original request directly. Do not mention the tool call.`,
+            content: `Tool result:\n${contentToText(part.content)}\n\nContinue the user's task. If more inspection, edits, or commands are needed, request exactly one tool call. Otherwise answer concisely.`,
           });
         }
         const rest = message.content.filter((part) => part?.type !== "tool_result");
@@ -239,6 +239,7 @@ function anthropicToolsToPrompt(tools, messages) {
     'Preferred format: <tool_call>{"name":"ToolName","input":{...}}</tool_call>',
     'Alternative format: <tool-use name="ToolName"><parameter name="field">value</parameter></tool-use>',
     "For exploring a codebase, prefer Read or Glob before Bash.",
+    "For creating a new file, use Write. Do not use Edit with an empty old_string.",
     "Only use parameter names from input_schema. Do not invent fields such as limit.",
     "After a tool result is provided, continue normally or request another tool call.",
     "Available tools:",
@@ -247,10 +248,7 @@ function anthropicToolsToPrompt(tools, messages) {
 }
 
 function selectRelevantTools(tools, messages) {
-  const lastUserText = [...(Array.isArray(messages) ? messages : [])]
-    .reverse()
-    .find((message) => message?.role === "user");
-  const text = contentToText(lastUserText?.content).toLowerCase();
+  const text = userIntentText(messages).toLowerCase();
   if (!text) {
     return [];
   }
@@ -264,10 +262,10 @@ function selectRelevantTools(tools, messages) {
   if (/(grep|search|find|rg|搜索|查找|寻找|匹配)/i.test(text)) {
     add("Grep", "Glob", "Read");
   }
-  if (/(edit|write|modify|patch|change|fix|implement|update|修改|编辑|写入|修复|实现|更新|改成|补丁)/i.test(text)) {
+  if (/(edit|write|create|build|scaffold|modify|patch|change|fix|implement|update|add|website|blog|html|css|javascript|修改|编辑|写入|创建|生成|新增|制作|修复|实现|更新|改成|补丁)/i.test(text)) {
     add("Read", "Edit", "MultiEdit", "Write", "Grep", "Glob");
   }
-  if (/(bash|shell|run|execute|command|test|npm|uv|python|node|执行|运行|命令|测试)/i.test(text)) {
+  if (/(bash|shell|run|execute|command|test|npm|uv|python|node|server|preview|deploy|serve|执行|运行|命令|测试|部署|预览|服务)/i.test(text)) {
     add("Bash", "Read");
   }
   if (/(总结|概览|项目|结构|目录|overview|summarize|structure|repo|codebase)/i.test(text)) {
@@ -278,6 +276,23 @@ function selectRelevantTools(tools, messages) {
     return [];
   }
   return tools.filter((tool) => wanted.has(String(tool?.name || "").toLowerCase()));
+}
+
+function userIntentText(messages) {
+  const userTexts = [];
+  for (const message of Array.isArray(messages) ? messages : []) {
+    if (message?.role !== "user") {
+      continue;
+    }
+    if (Array.isArray(message.content) && message.content.some((part) => part?.type === "tool_result")) {
+      continue;
+    }
+    const text = contentToText(message.content);
+    if (text) {
+      userTexts.push(text);
+    }
+  }
+  return userTexts.join("\n");
 }
 
 function anthropicToolsToOpenAI(tools) {
@@ -347,10 +362,10 @@ function toAnthropicMessage(payload, requestedModel, tools, requestId) {
   const choice = payload?.choices?.[0] || {};
   const message = choice.message || {};
   const content = [];
-  const parsedTool = parseToolWithLog(message.content, tools, requestId, false);
+  const parsedTools = parseToolsWithLog(message.content, tools, requestId, false);
 
-  if (parsedTool) {
-    content.push(parsedTool);
+  if (parsedTools.length > 0) {
+    content.push(...parsedTools);
   } else if (typeof message.content === "string" && message.content) {
     content.push({ type: "text", text: message.content });
   }
@@ -370,7 +385,7 @@ function toAnthropicMessage(payload, requestedModel, tools, requestId) {
     role: "assistant",
     model: requestedModel || payload?.model || DEFAULT_MODEL,
     content,
-    stop_reason: parsedTool ? "tool_use" : stopReason(choice.finish_reason),
+    stop_reason: parsedTools.length > 0 || (message.tool_calls || []).length > 0 ? "tool_use" : stopReason(choice.finish_reason),
     stop_sequence: null,
     usage: {
       input_tokens: payload?.usage?.prompt_tokens || 0,
@@ -380,22 +395,42 @@ function toAnthropicMessage(payload, requestedModel, tools, requestId) {
 }
 
 function parseToolWithLog(text, tools, requestId, stream) {
-  const result = parseToolCallDetailed(text, tools);
-  if (result.tool) {
+  return parseToolsWithLog(text, tools, requestId, stream)[0] || null;
+}
+
+function parseToolsWithLog(text, tools, requestId, stream) {
+  const result = parseToolCallsDetailed(text, tools);
+  if (result.tools.length === 1) {
+    const tool = result.tools[0];
     log("tool-parse-hit", {
       requestId,
       stream,
-      tool: result.tool.name,
-      inputKeys: Object.keys(result.tool.input || {}),
+      tool: tool.name,
+      inputKeys: Object.keys(tool.input || {}),
       rawInputKeys: result.rawInputKeys,
       strippedKeys: result.strippedKeys,
-      inputPreview: preview(JSON.stringify(result.tool.input || {}), 500),
+      inputPreview: preview(JSON.stringify(tool.input || {}), 500),
       matchedFormat: result.matchedFormat,
       candidates: result.candidates,
       rejected: result.rejected,
       modelTextPreview: preview(text, 1000),
     });
-    return result.tool;
+    return result.tools;
+  }
+  if (result.tools.length > 1) {
+    log("tool-parse-hit", {
+      requestId,
+      stream,
+      tool: result.tools[0].name,
+      tools: result.tools.map((tool) => tool.name),
+      toolCount: result.tools.length,
+      inputKeys: result.tools.map((tool) => Object.keys(tool.input || {})),
+      matchedFormat: result.matchedFormat,
+      candidates: result.candidates,
+      rejected: result.rejected,
+      modelTextPreview: preview(text, 1000),
+    });
+    return result.tools;
   }
   if (result.candidates > 0 || looksLikeToolText(text)) {
     log("tool-parse-miss", {
@@ -407,7 +442,7 @@ function parseToolWithLog(text, tools, requestId, stream) {
       modelTextPreview: preview(text, 1000),
     });
   }
-  return null;
+  return [];
 }
 
 function looksLikeToolText(text) {
@@ -457,6 +492,7 @@ function streamAnthropicFromUpstream(res, upstreamRes, requestedModel, tools, re
   let text = "";
   let stop = "end_turn";
   let usage = { input_tokens: 0, output_tokens: 0 };
+  const nativeToolCalls = new Map();
 
   function handleData(dataText) {
     if (dataText === "[DONE]") {
@@ -490,10 +526,22 @@ function streamAnthropicFromUpstream(res, upstreamRes, requestedModel, tools, re
       text += delta.content;
     }
     for (const toolCall of delta.tool_calls || []) {
-      text += `<tool_call>${JSON.stringify({
-        name: toolCall.function?.name,
-        input: safeJson(toolCall.function?.arguments),
-      })}</tool_call>`;
+      const key = Number.isInteger(toolCall.index) ? toolCall.index : nativeToolCalls.size;
+      const current = nativeToolCalls.get(key) || {
+        id: toolCall.id || `toolu_${Date.now().toString(36)}_${key}`,
+        name: "",
+        arguments: "",
+      };
+      if (toolCall.id) {
+        current.id = toolCall.id;
+      }
+      if (toolCall.function?.name) {
+        current.name = toolCall.function.name;
+      }
+      if (typeof toolCall.function?.arguments === "string") {
+        current.arguments += toolCall.function.arguments;
+      }
+      nativeToolCalls.set(key, current);
       stop = "tool_use";
     }
   }
@@ -528,28 +576,39 @@ function streamAnthropicFromUpstream(res, upstreamRes, requestedModel, tools, re
         handleData(dataLine);
       }
     }
-    const parsedTool = parseToolWithLog(text, tools, requestId, true);
-    if (parsedTool) {
-      const inputJson = JSON.stringify(parsedTool.input || {});
-      writeSse(res, "content_block_start", {
-        type: "content_block_start",
-        index: 0,
-        content_block: {
-          type: "tool_use",
-          id: parsedTool.id,
-          name: parsedTool.name,
-          input: {},
-        },
+    const nativeTools = [...nativeToolCalls.entries()]
+      .sort((a, b) => a[0] - b[0])
+      .map(([, toolCall]) => ({
+        type: "tool_use",
+        id: toolCall.id,
+        name: toolCall.name,
+        input: safeJson(toolCall.arguments),
+      }))
+      .filter((toolCall) => toolCall.name);
+    const parsedTools = nativeTools.length > 0 ? nativeTools : parseToolsWithLog(text, tools, requestId, true);
+    if (parsedTools.length > 0) {
+      parsedTools.forEach((parsedTool, index) => {
+        const inputJson = JSON.stringify(parsedTool.input || {});
+        writeSse(res, "content_block_start", {
+          type: "content_block_start",
+          index,
+          content_block: {
+            type: "tool_use",
+            id: parsedTool.id,
+            name: parsedTool.name,
+            input: {},
+          },
+        });
+        writeSse(res, "content_block_delta", {
+          type: "content_block_delta",
+          index,
+          delta: {
+            type: "input_json_delta",
+            partial_json: inputJson,
+          },
+        });
+        writeSse(res, "content_block_stop", { type: "content_block_stop", index });
       });
-      writeSse(res, "content_block_delta", {
-        type: "content_block_delta",
-        index: 0,
-        delta: {
-          type: "input_json_delta",
-          partial_json: inputJson,
-        },
-      });
-      writeSse(res, "content_block_stop", { type: "content_block_stop", index: 0 });
       stop = "tool_use";
     } else if (text) {
       writeSse(res, "content_block_start", {
@@ -704,25 +763,43 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, HOST, () => {
-  fs.writeFileSync(PID_PATH, String(process.pid), "utf8");
-  log("listening", { host: HOST, port: PORT, model: DEFAULT_MODEL });
-});
+function startServer() {
+  server.listen(PORT, HOST, () => {
+    fs.writeFileSync(PID_PATH, String(process.pid), "utf8");
+    log("listening", { host: HOST, port: PORT, model: DEFAULT_MODEL });
+  });
 
-function cleanup() {
-  try {
-    if (fs.existsSync(PID_PATH) && fs.readFileSync(PID_PATH, "utf8").trim() === String(process.pid)) {
-      fs.unlinkSync(PID_PATH);
-    }
-  } catch {}
+  function cleanup() {
+    try {
+      if (fs.existsSync(PID_PATH) && fs.readFileSync(PID_PATH, "utf8").trim() === String(process.pid)) {
+        fs.unlinkSync(PID_PATH);
+      }
+    } catch {}
+  }
+
+  process.on("SIGINT", () => {
+    cleanup();
+    process.exit(0);
+  });
+  process.on("SIGTERM", () => {
+    cleanup();
+    process.exit(0);
+  });
+  process.on("exit", cleanup);
 }
 
-process.on("SIGINT", () => {
-  cleanup();
-  process.exit(0);
-});
-process.on("SIGTERM", () => {
-  cleanup();
-  process.exit(0);
-});
-process.on("exit", cleanup);
+if (require.main === module) {
+  startServer();
+}
+
+module.exports = {
+  anthropicMessagesToOpenAI,
+  anthropicToolsToPrompt,
+  buildUpstreamBody,
+  contentToText,
+  resolveDeepseekThinking,
+  selectRelevantTools,
+  startServer,
+  toAnthropicMessage,
+  userIntentText,
+};

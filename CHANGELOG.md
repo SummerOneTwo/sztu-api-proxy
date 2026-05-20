@@ -5,10 +5,11 @@ All notable changes to this project are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.0] - 2026-05-21
 
 ### Added
 
+- Added a local Switchboard dashboard and CLI for proxy control, service status, logs, environment configuration, and Windows autostart.
 - Added a structured JSONL logger shared by OpenCode, CodeBuddy, and Claude Code proxies, with request IDs, sanitized request/upstream summaries, durations, upstream error previews, and Claude Code tool parsing diagnostics.
 - Added `claudecode/tool-parser.js`, a dedicated Claude Code tool-call parsing and repair pipeline inspired by `ds-free-api` design ideas without copying GPL code.
 - Added parser-only regression tests in `scripts/test-tool-parser.js` for malformed Claude Code tool-call outputs.
@@ -36,6 +37,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed `Glob` tool failures caused by model-invented parameters such as `limit` being forwarded to Claude Code.
 - Fixed `tool-parse-miss` when DeepSeek returned `Tool: ToolName` + `Tool: {json}` or `<tool-calls>` inline tool blocks.
 - Fixed `tool-parse-miss` for `<tool_call name="Read"><file_path>...</file_path></tool_call>` child-element XML.
+- Fixed `tool-parse-miss` for DeepSeek `<tool-call name="Read"><parameter name="file_path" string="true">...</parameter></tool-call>` output.
+- Fixed Claude Code sessions stopping after the first tool result by preserving the original user intent when selecting follow-up tools.
+- Fixed DeepSeek `Write`/`Edit` mismatches when Claude Code exposes only one of the two file-writing tools.
+- Fixed additional DeepSeek XML variants including `<invoke name="...">`, unnamed `<tool_call><parameter ...>`, and XML entity-encoded file contents.
+- Fixed multiple tool calls in one DeepSeek completion being reduced to the first tool only.
+- Fixed native streaming `tool_calls` parameter loss by accumulating argument deltas before converting them to Anthropic `tool_use`.
 - Expanded Claude Code proxy logs with `client_thinking`, `deepseek_thinking`, `inputPreview`, `rawInputKeys`, and `strippedKeys`.
 
 ## [0.1.0] - 2026-05-19

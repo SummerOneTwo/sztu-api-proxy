@@ -607,6 +607,35 @@ Tool: {"file_path":"README.md"}
 
 15. Truncated quoted Bash commands (repair leading quote, reject unbalanced quotes).
 
+16. DeepSeek hyphenated `<tool-call>` with extra parameter attributes:
+
+```text
+<tool-call name="Read"><parameter name="file_path" string="true">README.md</parameter></tool-call>
+```
+
+17. DeepSeek `<invoke name="...">` XML:
+
+```text
+<invoke name="Write"><parameter name="file_path">index.html</parameter><parameter name="content">&lt;!doctype html&gt;</parameter></invoke>
+```
+
+18. Unnamed parameter XML where the tool is inferred from the inputs:
+
+```text
+<tool_call><parameter name="command">node --version</parameter></tool_call>
+```
+
+19. `Write`/`Edit` mismatches when Claude Code exposes only one of those tools.
+If `Write` is unavailable but `Edit` is allowed, `content` is converted to
+`new_string` and `old_string` is filled from the existing file when possible.
+If `Edit` uses an empty `old_string` while `Write` is available, the call is
+converted to `Write`.
+
+When a completion contains multiple valid tool calls, the parser can now return
+all of them. The older single-call API still returns the first parsed tool for
+compatibility, while the proxy uses the multi-call API and emits multiple
+Anthropic `tool_use` content blocks with separate indexes.
+
 Before returning `tool_use`, the parser drops any input keys that are not listed
 in the Claude Code tool `input_schema.properties`. This prevents errors such as:
 
@@ -635,8 +664,8 @@ does not copy that project's GPL code. It applies these steps:
    keys, and unescaped Windows backslashes.
 6. Enforce the Claude Code tool whitelist, required input fields, and
    `input_schema.properties` allowlist.
-7. Return the first valid candidate; otherwise return diagnostic metadata for
-   logging.
+7. Return every valid candidate through `parseToolCallsDetailed`; the legacy
+   `parseToolCallDetailed` wrapper still returns the first valid tool.
 ```
 
 This matters because a malformed tool call should not be silently treated as a
@@ -651,8 +680,15 @@ node .\scripts\test-tool-parser.js
 This test includes the `Read / Read: file_path: ...` failure format, escaped
 and unescaped Windows paths, DeepSeek-style tags, JSON arrays, code-fence false
 positives, allowed-tool filtering, missing required arguments, `Tool: {json}`,
-`<tool-use>`, `<tool-calls>` inline tools, truncated Bash quotes, and Glob
-schema field filtering.
+`<tool-use>`, hyphenated `<tool-call>`, `<tool-calls>` inline tools, truncated
+Bash quotes, XML entity decoding, `Write`/`Edit` repair, and Glob schema field
+filtering. It also verifies that schema-allowed optional parameters are
+preserved while unknown fields are stripped.
+
+If `CLAUDE_SZTU_FORWARD_TOOLS=1` is enabled, native OpenAI-compatible streaming
+`tool_calls` are accumulated by call index before JSON parsing. This preserves
+fragmented `function.arguments` instead of trying to parse partial argument
+chunks.
 
 ### Tool Result History
 
@@ -679,10 +715,21 @@ The tool result is sent upstream as:
 Tool result:
 ...
 
-Answer the user's original request directly. Do not mention the tool call.
+Continue the user's task. If more inspection, edits, or commands are needed,
+request exactly one tool call. Otherwise answer concisely.
 ```
 
-This avoids the model simply repeating the tool call.
+This avoids the model simply repeating the tool call while still allowing
+multi-step tasks such as creating files and then running a local preview.
+Tool selection also ignores `tool_result` messages and uses the original user
+request, so a plain `ls` result does not accidentally hide `Write`, `Edit`, or
+`Bash` during the next turn.
+
+Proxy helper regression test:
+
+```powershell
+node .\scripts\test-claudecode-proxy.js
+```
 
 ### Verified Claude Code Commands
 

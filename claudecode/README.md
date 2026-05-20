@@ -26,6 +26,7 @@ node .\claudecode\claudecode-proxy.js
 
 ```powershell
 node .\scripts\test-tool-parser.js
+node .\scripts\test-claudecode-proxy.js
 node .\scripts\test-api.js claudecode
 ```
 
