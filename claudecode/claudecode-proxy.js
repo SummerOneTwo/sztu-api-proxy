@@ -387,6 +387,9 @@ function parseToolWithLog(text, tools, requestId, stream) {
       stream,
       tool: result.tool.name,
       inputKeys: Object.keys(result.tool.input || {}),
+      rawInputKeys: result.rawInputKeys,
+      strippedKeys: result.strippedKeys,
+      inputPreview: preview(JSON.stringify(result.tool.input || {}), 500),
       matchedFormat: result.matchedFormat,
       candidates: result.candidates,
       rejected: result.rejected,
@@ -595,6 +598,7 @@ function proxyMessages(req, res, body) {
   }
 
   const upstreamBody = buildUpstreamBody(body);
+  const deepseekThinking = resolveDeepseekThinking(body);
   log("request", {
     requestId,
     method: req.method,
@@ -602,6 +606,8 @@ function proxyMessages(req, res, body) {
     client: summarizeAnthropicBody(body),
     upstream: summarizeBody(upstreamBody),
     upstreamBytes: Buffer.byteLength(JSON.stringify(upstreamBody)),
+    client_thinking: body?.thinking?.type,
+    deepseek_thinking: deepseekThinking,
   });
 
   const payload = JSON.stringify(upstreamBody);

@@ -164,6 +164,21 @@ const cases = [
     text: "<tool-calls><tool_use id=\"x\">Bash: tree -L 2</tool_use><tool_use id=\"y\">Read: package.json</tool_use></tool-calls>",
     expect: { name: "Bash", input: { command: "tree -L 2" } },
   },
+  {
+    name: "named xml child elements read",
+    text: '<tool_call name="Read"><file_path>README.md</file_path></tool_call>',
+    expect: { name: "Read", input: { file_path: "README.md" } },
+  },
+  {
+    name: "named xml child elements bash strips description",
+    text: '<tool_call name="Bash"><command>find .</command><description>List files</description></tool_call>',
+    expect: { name: "Bash", input: { command: "find ." } },
+  },
+  {
+    name: "repeated named xml child elements first read",
+    text: '<tool_call name="Read"><file_path>README.md</file_path></tool_call><tool_call name="Read"><file_path>CHANGELOG.md</file_path></tool_call>',
+    expect: { name: "Read", input: { file_path: "README.md" } },
+  },
 ];
 
 for (const testCase of cases) {

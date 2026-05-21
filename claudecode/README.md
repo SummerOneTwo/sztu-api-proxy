@@ -36,8 +36,9 @@ node .\scripts\test-api.js claudecode
 | event | 含义 |
 |-------|------|
 | `request` | 客户端与上游摘要；含 `client.thinking`、`upstream.chat_template_kwargs` |
-| `tool-parse-hit` | 模型文本已转为 `tool_use`；看 `inputKeys`、`matchedFormat` |
-| `tool-parse-miss` | 像工具调用但未解析成功；看 `modelTextPreview` |
+| `tool-parse-hit` | 模型文本已转为 `tool_use`；看 `matchedFormat`、`inputKeys`、`inputPreview`、`strippedKeys` |
+| `tool-parse-miss` | 像工具调用但未解析成功；看 `modelTextPreview`、`rejected` |
+| `request` | 含 `client_thinking`、`deepseek_thinking` 与上下游摘要 |
 | `upstream-error-response` | SZTU/APISIX 上游错误（如 502） |
 
 ```powershell

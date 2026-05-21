@@ -35,6 +35,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed Bash commands with truncated opening quotes being passed to Claude Code shell execution.
 - Fixed `Glob` tool failures caused by model-invented parameters such as `limit` being forwarded to Claude Code.
 - Fixed `tool-parse-miss` when DeepSeek returned `Tool: ToolName` + `Tool: {json}` or `<tool-calls>` inline tool blocks.
+- Fixed `tool-parse-miss` for `<tool_call name="Read"><file_path>...</file_path></tool_call>` child-element XML.
+- Expanded Claude Code proxy logs with `client_thinking`, `deepseek_thinking`, `inputPreview`, `rawInputKeys`, and `strippedKeys`.
 
 ## [0.1.0] - 2026-05-19
 

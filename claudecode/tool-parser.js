@@ -25,13 +25,15 @@ function parseToolCallDetailed(text, allowedTools) {
 
   for (const candidate of candidates) {
     const parsed = parseCandidate(candidate, tools);
-    const tool = finalizeTool(parsed, tools);
-    if (tool) {
+    const finalized = finalizeTool(parsed, tools);
+    if (finalized) {
       return {
-        tool,
+        tool: finalized.tool,
         candidates: candidates.length,
         rejected,
         matchedFormat: candidate.format,
+        rawInputKeys: finalized.rawInputKeys,
+        strippedKeys: finalized.strippedKeys,
       };
     }
     rejected.push({
@@ -254,6 +256,12 @@ function parseCandidate(candidate) {
       input: parseParameterXml(candidate.inputText),
     };
   }
+  if (candidate.format === "named-xml" || candidate.format === "broken-tool-call") {
+    return {
+      name: candidate.name,
+      input: parseNamedXmlInput(candidate.inputText),
+    };
+  }
   if (candidate.format === "arg-key-xml") {
     return {
       name: candidate.name,
@@ -335,6 +343,30 @@ function parseParameterXml(text) {
   return input;
 }
 
+function parseChildElementXml(text) {
+  const input = {};
+  const tags = text.matchAll(/<([A-Za-z_][A-Za-z0-9_-]*)\s*>\s*([\s\S]*?)\s*<\/\1\s*>/gi);
+  for (const tag of tags) {
+    input[tag[1]] = tag[2].trim();
+  }
+  return input;
+}
+
+function parseNamedXmlInput(text) {
+  const source = String(text || "").trim();
+  if (!source) {
+    return {};
+  }
+  if (/<parameter\s+name=/i.test(source)) {
+    return parseParameterXml(source);
+  }
+  const childInput = parseChildElementXml(source);
+  if (Object.keys(childInput).length > 0) {
+    return childInput;
+  }
+  return parseInputText(source);
+}
+
 function parseArgKeyXml(text) {
   const input = {};
   const pairs = text.matchAll(/<arg_key>\s*([\s\S]*?)\s*<\/arg_key>\s*<arg_value>\s*([\s\S]*?)\s*<\/arg_value>/gi);
@@ -383,10 +415,13 @@ function finalizeTool(parsed, tools) {
       input[key] = normalizeInputValue(value);
     }
   }
+  const rawInputKeys = Object.keys(input);
+  const strippedKeys = [];
   const allowedProps = allowed?.properties;
   if (allowedProps && allowedProps.length > 0) {
     for (const key of Object.keys(input)) {
       if (!allowedProps.includes(key)) {
+        strippedKeys.push(key);
         delete input[key];
       }
     }
@@ -400,10 +435,14 @@ function finalizeTool(parsed, tools) {
   }
 
   return {
-    type: "tool_use",
-    id: `toolu_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
-    name,
-    input,
+    tool: {
+      type: "tool_use",
+      id: `toolu_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
+      name,
+      input,
+    },
+    rawInputKeys,
+    strippedKeys,
   };
 }
 
