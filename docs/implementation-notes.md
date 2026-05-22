@@ -114,12 +114,14 @@ Omitting max_tokens may trigger a server-side default that causes 500.
 Proxy policy:
 
 ```text
-SZTU_DEFAULT_MAX_TOKENS=16384
+SZTU_DEFAULT_MAX_TOKENS=32768
 SZTU_MAX_TOKENS=32768
+SZTU_THINKING_MIN_MAX_TOKENS=10000
 ```
 
 The proxies clamp client-provided larger values to the configured default
-maximum.
+maximum. Claude Code thinking requests are floored to the configured thinking
+minimum unless the client already requested a larger budget.
 
 ### GLM 502 Instability
 
@@ -160,23 +162,28 @@ DeepSeek was generally more stable than GLM during Claude Code testing.
 
 ### Native OpenAI Tools
 
-Direct SZTU requests with OpenAI `tools` were not usable during testing.
+Earlier tests showed SZTU instability when forwarding large Claude Code tool
+lists directly. Current testing with small built-in tool sets shows
+`deepseek-v4-pro` can return standard OpenAI-compatible `tool_calls`.
 
-GLM with `tools` returned:
-
-```text
-500 Internal Server Error
-```
-
-DeepSeek with `tools` sometimes reset the TLS connection or failed at the
-gateway.
-
-Conclusion:
+Current strategy:
 
 ```text
-Do not rely on SZTU native OpenAI tools for these models.
-For Claude Code, use prompt-mediated tool calls and translate them in the proxy.
+Use native OpenAI tool_calls by default.
+Keep prompt-mediated parsing as fallback via CLAUDE_SZTU_TOOL_MODE=prompt.
+Treat strict function calling as experimental until SZTU support is verified.
 ```
+
+SZTU-specific history caveat:
+
+```text
+SZTU currently accepts native tool_calls as model output, but rejects request
+history containing assistant tool_calls or role=tool messages.
+```
+
+For this reason, `CLAUDE_SZTU_TOOL_HISTORY_MODE=text` is the default. It keeps
+the first tool call native, then sends tool results back as user text. A future
+fully OpenAI-compatible backend can opt into `structured`.
 
 ## OpenCode Proxy
 
@@ -394,84 +401,47 @@ Fix:
 new URL(req.url || "/", `http://${HOST}:${PORT}`).pathname
 ```
 
-### Why Native Tool Forwarding Was Disabled
+### Native Tool Forwarding
 
-Claude Code sends a large Anthropic `tools` list. Directly converting this list
-to OpenAI `tools` and forwarding it to SZTU caused failures:
+The current default is native OpenAI-compatible tool forwarding.
+Claude Code `tools` are translated into OpenAI `tools`, then SZTU/DeepSeek
+`tool_calls` are translated back into Anthropic `tool_use`.
 
-```text
-GLM: 500
-DeepSeek: connection reset or gateway failure
-```
-
-The current proxy does not forward native tools by default.
-
-Native forwarding can be experimented with using:
+The old prompt-mediated bridge is still available as a fallback via:
 
 ```env
-CLAUDE_SZTU_FORWARD_TOOLS=1
+CLAUDE_SZTU_TOOL_MODE=prompt
 ```
 
-But it is not the default because the SZTU endpoint did not reliably support
-OpenAI tool calls.
+Native mode avoids injecting XML tool instructions into the system prompt and
+keeps the tool loop closer to the actual provider protocol.
 
-### Prompt-Mediated Tool Bridge
+### Tool Result History
 
-Instead of native OpenAI tools, the proxy selectively injects a small tool
-instruction into the system prompt.
+In default SZTU mode, Claude Code `tool_result` messages are forwarded as
+plain user text because the SZTU schema rejects request history containing
+assistant `tool_calls` or `role: "tool"` messages.
 
-The instruction asks the model to output:
+`CLAUDE_SZTU_TOOL_HISTORY_MODE=structured` keeps the standard OpenAI loop:
+assistant `tool_calls` followed by `role: "tool"` with the matching
+`tool_call_id`. This is kept for future compatible providers, not the current
+SZTU default.
+
+In prompt mode, the proxy keeps the older text bridge:
 
 ```text
-<tool_call>{"name":"Read","input":{"file_path":"..."}}</tool_call>
+Tool result:
+...
+
+Continue the user's task. If more inspection, edits, or commands are needed,
+request exactly one tool call. Otherwise answer concisely.
 ```
 
-The proxy then converts this model text into Anthropic content:
-
-```json
-{
-  "type": "tool_use",
-  "id": "toolu_...",
-  "name": "Read",
-  "input": {
-    "file_path": "..."
-  }
-}
-```
-
-Claude Code receives the `tool_use`, executes the tool, then sends a
-`tool_result` back to the proxy. The proxy converts that result into normal
-OpenAI-style chat history for SZTU.
-
-### Tool Prompt Minimization
-
-Injecting all Claude Code tools made GLM unstable. It sometimes returned an
-empty stream with usage `0/0`, or SZTU returned 502.
-
-Final strategy:
-
-```text
-Only inject tool instructions when the user prompt clearly asks for external
-state or action.
-Only include relevant tools.
-```
-
-Examples:
-
-```text
-read/open/file/CLAUDE.md/AGENTS.md -> Read, LS
-grep/search/find                  -> Grep, Glob, Read
-edit/write/fix/implement          -> Read, Edit, MultiEdit, Write, Grep, Glob
-run/test/bash/uv/python/node      -> Bash, Read
-summarize/overview/structure/repo -> Read, Glob, Grep
-```
-
-For normal chat such as `please only reply OK`, the proxy injects no tool
-prompt.
+This keeps the old parser path available for fallback and regression checks.
 
 ### Claude Code DeepSeek-Only Mode (2026-05)
 
-The Claude Code proxy is currently optimized for `deepseek-v4-pro` only:
+The Claude Code proxy is still optimized for `deepseek-v4-pro` only:
 
 ```text
 All client model names map to SZTU_DEFAULT_MODEL (default: deepseek-v4-pro).
@@ -685,45 +655,24 @@ Bash quotes, XML entity decoding, `Write`/`Edit` repair, and Glob schema field
 filtering. It also verifies that schema-allowed optional parameters are
 preserved while unknown fields are stripped.
 
-If `CLAUDE_SZTU_FORWARD_TOOLS=1` is enabled, native OpenAI-compatible streaming
-`tool_calls` are accumulated by call index before JSON parsing. This preserves
-fragmented `function.arguments` instead of trying to parse partial argument
-chunks.
+In native mode, OpenAI-compatible streaming `tool_calls` are accumulated by
+call index before JSON parsing. This preserves fragmented `function.arguments`
+instead of trying to parse partial argument chunks.
 
 ### Tool Result History
 
-An early implementation converted previous assistant `tool_use` blocks back
-into OpenAI `tool_calls` in history. Since native OpenAI tools are not being
-used, this caused schema errors such as:
+Structured history mode keeps the OpenAI function-calling loop intact:
 
-```text
-request format doesn't match schema:
-property "messages" validation failed:
-property "content" validation failed: wrong type
+```json
+{ "role": "assistant", "tool_calls": [...] }
+{ "role": "tool", "tool_call_id": "...", "content": "..." }
 ```
 
-Final strategy:
-
-```text
-When native tool forwarding is disabled, drop assistant tool_use history.
-Keep only tool_result content as normal user text.
-```
-
-The tool result is sent upstream as:
-
-```text
-Tool result:
-...
-
-Continue the user's task. If more inspection, edits, or commands are needed,
-request exactly one tool call. Otherwise answer concisely.
-```
-
-This avoids the model simply repeating the tool call while still allowing
-multi-step tasks such as creating files and then running a local preview.
-Tool selection also ignores `tool_result` messages and uses the original user
-request, so a plain `ls` result does not accidentally hide `Write`, `Edit`, or
-`Bash` during the next turn.
+The SZTU default is text history because direct tests showed 400 schema errors
+for assistant `tool_calls` / `role: "tool"` in request history. Tool selection
+still ignores `tool_result` messages and uses the original user request, so a
+plain `ls` result does not accidentally hide `Write`, `Edit`, or `Bash` during
+the next turn.
 
 Proxy helper regression test:
 
@@ -803,9 +752,10 @@ This proxy is a compatibility layer, not a full Anthropic implementation.
 
 Known limitations:
 
-- Tool calling is prompt-mediated, not native model tool calling.
-- Tool format compliance depends on model behavior; the proxy includes several
-  fallback parsers.
+- Tool calling is native by default, but large MCP tool sets still need more
+  real-world coverage.
+- If the upstream model returns text instead of `tool_calls`, fallback parser
+  quality still depends on model formatting.
 - GLM can be unstable behind SZTU/APISIX and sometimes returns 502.
 - Long Claude Code system prompts make requests expensive in prompt tokens.
 - Image/document inputs are currently omitted as text placeholders.

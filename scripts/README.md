@@ -68,12 +68,12 @@ node .\scripts\test-switchboard.js
 The Claude Code suite checks:
 
 - health endpoint
-- GLM non-streaming
-- GLM streaming usage
-- DeepSeek non-streaming
-- DeepSeek streaming usage
-- GLM prompt-mediated tool bridge
-- DeepSeek prompt-mediated tool bridge
+- Sonnet and Haiku Claude model aliases routed to the configured default SZTU model
+- non-streaming Anthropic message conversion
+- streaming Anthropic SSE conversion with usage
+- native `tool_calls` to Anthropic `tool_use` conversion
+- native streaming `tool_calls` conversion
+- SZTU-compatible text-mode tool-result history loop
 
 When a proxy test fails, check the JSONL runtime logs and search by
 `requestId`:

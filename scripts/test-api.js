@@ -306,6 +306,87 @@ async function anthropicToolBridge(name, model) {
   });
 }
 
+async function anthropicToolBridgeStream(name, model) {
+  return testCase(name, async () => {
+    const res = await postJson(CLAUDE_URL, {
+      model,
+      messages: [{ role: "user", content: "请使用 Read 工具读取 CLAUDE.md。只发工具调用。" }],
+      max_tokens: 512,
+      stream: true,
+      tools: [{
+        name: "Read",
+        description: "Read a file from disk",
+        input_schema: {
+          type: "object",
+          properties: {
+            file_path: { type: "string" },
+          },
+          required: ["file_path"],
+        },
+      }],
+    }, {
+      "x-api-key": "any",
+      "anthropic-version": "2023-06-01",
+    });
+    assertOk(res.status === 200, `status=${res.status} body=${res.text.slice(0, 300)}`);
+    const events = parseSse(res.text);
+    const starts = events
+      .filter((event) => event.event === "content_block_start")
+      .map((event) => parseJson(event.data));
+    const toolStart = starts.find((event) => event?.content_block?.type === "tool_use");
+    assertOk(toolStart, `missing streaming tool_use start=${res.text.slice(0, 500)}`);
+    assertOk(toolStart.content_block.name === "Read", `unexpected streaming tool name=${toolStart.content_block.name}`);
+    const deltas = events
+      .filter((event) => event.event === "content_block_delta")
+      .map((event) => parseJson(event.data));
+    assertOk(
+      deltas.some((event) => event?.delta?.type === "input_json_delta" && event.delta.partial_json.includes("file_path")),
+      `missing streaming tool input delta=${res.text.slice(0, 500)}`,
+    );
+    return `tool=${toolStart.content_block.name}`;
+  });
+}
+
+async function anthropicToolResultLoop(name, model) {
+  return testCase(name, async () => {
+    const res = await postJson(CLAUDE_URL, {
+      model,
+      messages: [
+        { role: "user", content: "请使用 Read 工具读取 README.md，然后只回复工具结果里的标记。" },
+        {
+          role: "assistant",
+          content: [{ type: "tool_use", id: "call_read_1", name: "Read", input: { file_path: "README.md" } }],
+        },
+        {
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: "call_read_1", content: "LOOP_OK_FROM_TOOL" }],
+        },
+      ],
+      max_tokens: 512,
+      stream: false,
+      tools: [{
+        name: "Read",
+        description: "Read a file from disk",
+        input_schema: {
+          type: "object",
+          properties: {
+            file_path: { type: "string" },
+          },
+          required: ["file_path"],
+        },
+      }],
+    }, {
+      "x-api-key": "any",
+      "anthropic-version": "2023-06-01",
+    });
+    assertOk(res.status === 200, `status=${res.status} body=${res.text.slice(0, 300)}`);
+    const json = parseJson(res.text);
+    const text = json?.content?.map((part) => part.text || "").join("") || "";
+    assertOk(text.includes("LOOP_OK_FROM_TOOL"), `unexpected loop response=${res.text.slice(0, 500)}`);
+    return "loop=ok";
+  });
+}
+
 async function testClaudeCode() {
   const ok = [];
   ok.push(await testCase("claudecode proxy health", async () => {
@@ -313,12 +394,14 @@ async function testClaudeCode() {
     assertOk(res.status === 200, `status=${res.status} body=${res.text.slice(0, 200)}`);
     return res.text;
   }));
-  ok.push(await anthropicNonStream("claudecode glm non-stream", "claude-sonnet-4-5", "GLM_OK"));
-  ok.push(await anthropicStream("claudecode glm stream usage", "claude-sonnet-4-5", "GLM_STREAM_OK"));
-  ok.push(await anthropicNonStream("claudecode deepseek non-stream", "claude-3-5-haiku-latest", "DS_OK"));
-  ok.push(await anthropicStream("claudecode deepseek stream usage", "claude-3-5-haiku-latest", "DS_STREAM_OK"));
-  ok.push(await anthropicToolBridge("claudecode glm tool bridge", "claude-sonnet-4-5"));
-  ok.push(await anthropicToolBridge("claudecode deepseek tool bridge", "claude-3-5-haiku-latest"));
+  ok.push(await anthropicNonStream("claudecode sonnet alias non-stream", "claude-sonnet-4-5", "SONNET_ALIAS_OK"));
+  ok.push(await anthropicStream("claudecode sonnet alias stream usage", "claude-sonnet-4-5", "SONNET_ALIAS_STREAM_OK"));
+  ok.push(await anthropicNonStream("claudecode haiku alias non-stream", "claude-3-5-haiku-latest", "HAIKU_ALIAS_OK"));
+  ok.push(await anthropicStream("claudecode haiku alias stream usage", "claude-3-5-haiku-latest", "HAIKU_ALIAS_STREAM_OK"));
+  ok.push(await anthropicToolBridge("claudecode sonnet alias tool bridge", "claude-sonnet-4-5"));
+  ok.push(await anthropicToolBridge("claudecode haiku alias tool bridge", "claude-3-5-haiku-latest"));
+  ok.push(await anthropicToolBridgeStream("claudecode haiku alias tool bridge stream", "claude-3-5-haiku-latest"));
+  ok.push(await anthropicToolResultLoop("claudecode haiku alias tool result loop", "claude-3-5-haiku-latest"));
   return ok;
 }
 

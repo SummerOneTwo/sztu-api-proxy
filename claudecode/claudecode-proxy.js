@@ -1,6 +1,7 @@
 const http = require("http");
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 const { getApiKey, envNumber, loadDotEnv } = require("../shared/env");
 const { createLogger, durationMs, makeRequestId, preview, summarizeAnthropicBody, summarizeBody } = require("../shared/logger");
 const { parseToolCallsDetailed } = require("./tool-parser");
@@ -24,6 +25,8 @@ const STREAM_TOTAL_TIMEOUT_MS = Math.max(STREAM_READ_TIMEOUT_MS, envNumber("CLAU
 const STREAM_PARSE_CHARS = Math.max(4000, envNumber("CLAUDE_SZTU_STREAM_PARSE_CHARS", 60000));
 const UPSTREAM_RETRY_ATTEMPTS = Math.max(1, Math.trunc(envNumber("CLAUDE_SZTU_UPSTREAM_RETRY_ATTEMPTS", 1)));
 const FAILURE_STATUS = Math.max(400, Math.trunc(envNumber("CLAUDE_SZTU_FAILURE_STATUS", 424)));
+const TOOL_MODES = new Set(["native", "prompt", "strict"]);
+const TOOL_HISTORY_MODES = new Set(["text", "structured"]);
 
 function resolveDeepseekThinking(body) {
   const config = body?.thinking;
@@ -61,6 +64,24 @@ const resolveUpstreamThinking = resolveDeepseekThinking;
 
 function failureStatus() {
   return FAILURE_STATUS;
+}
+
+function resolveToolMode(explicit) {
+  const raw =
+    explicit ||
+    process.env.CLAUDE_SZTU_TOOL_MODE ||
+    (process.env.CLAUDE_SZTU_FORWARD_TOOLS === "0" ? "prompt" : "native");
+  const mode = String(raw || "").trim().toLowerCase();
+  return TOOL_MODES.has(mode) ? mode : "native";
+}
+
+function isNativeToolMode(mode) {
+  return mode === "native" || mode === "strict";
+}
+
+function resolveToolHistoryMode(explicit) {
+  const mode = String(explicit || process.env.CLAUDE_SZTU_TOOL_HISTORY_MODE || "text").trim().toLowerCase();
+  return TOOL_HISTORY_MODES.has(mode) ? mode : "text";
 }
 
 async function fetchWithRetry(url, options) {
@@ -153,7 +174,11 @@ function contentToText(content) {
     .join("\n");
 }
 
-function anthropicMessagesToOpenAI(body) {
+function anthropicMessagesToOpenAI(body, options = {}) {
+  const toolMode = resolveToolMode(options.toolMode);
+  const nativeTools = isNativeToolMode(toolMode);
+  const structuredToolHistory = nativeTools && resolveToolHistoryMode(options.toolHistoryMode) === "structured";
+  const toolNameMaps = options.toolNameMaps || createToolNameMaps();
   const messages = [];
 
   const systemParts = [];
@@ -166,7 +191,7 @@ function anthropicMessagesToOpenAI(body) {
     }
   }
 
-  const toolPrompt = anthropicToolsToPrompt(body.tools, body.messages);
+  const toolPrompt = nativeTools ? "" : anthropicToolsToPrompt(body.tools, body.messages);
   if (toolPrompt) {
     systemParts.push(toolPrompt);
   }
@@ -186,17 +211,15 @@ function anthropicMessagesToOpenAI(body) {
       for (const part of message.content) {
         if (part?.type === "text" && typeof part.text === "string") {
           textParts.push(part.text);
-        } else if (part?.type === "tool_use") {
-          if (process.env.CLAUDE_SZTU_FORWARD_TOOLS === "1") {
-            toolCalls.push({
-              id: part.id,
-              type: "function",
-              function: {
-                name: part.name,
-                arguments: JSON.stringify(part.input || {}),
-              },
-            });
-          }
+        } else if (part?.type === "tool_use" && structuredToolHistory) {
+          toolCalls.push({
+            id: part.id,
+            type: "function",
+            function: {
+              name: upstreamToolName(part.name, toolNameMaps),
+              arguments: JSON.stringify(part.input || {}),
+            },
+          });
         }
       }
       if (textParts.length === 0 && toolCalls.length === 0) {
@@ -213,6 +236,28 @@ function anthropicMessagesToOpenAI(body) {
     if (Array.isArray(message.content)) {
       const toolResults = message.content.filter((part) => part?.type === "tool_result");
       if (toolResults.length > 0) {
+        if (structuredToolHistory) {
+          for (const part of toolResults) {
+            if (part.tool_use_id) {
+              messages.push({
+                role: "tool",
+                tool_call_id: part.tool_use_id,
+                content: contentToText(part.content),
+              });
+            } else {
+              messages.push({
+                role: "user",
+                content: `Tool result:\n${contentToText(part.content)}`,
+              });
+            }
+          }
+          const rest = message.content.filter((part) => part?.type !== "tool_result");
+          const restText = contentToText(rest);
+          if (restText) {
+            messages.push({ role: "user", content: restText });
+          }
+          continue;
+        }
         for (const part of toolResults) {
           messages.push({
             role: "user",
@@ -402,39 +447,139 @@ function userIntentText(messages) {
   return userTexts.join("\n");
 }
 
-function anthropicToolsToOpenAI(tools) {
+function createToolNameMaps() {
+  return {
+    toOriginal: new Map(),
+    toUpstream: new Map(),
+  };
+}
+
+function upstreamToolName(originalName, toolNameMaps = createToolNameMaps()) {
+  const original = String(originalName || "tool");
+  if (toolNameMaps.toUpstream.has(original)) {
+    return toolNameMaps.toUpstream.get(original);
+  }
+
+  let upstream = isValidOpenAiToolName(original) ? original : shortToolName(original, toolNameMaps.toOriginal.size);
+  while (toolNameMaps.toOriginal.has(upstream) && toolNameMaps.toOriginal.get(upstream) !== original) {
+    upstream = shortToolName(`${original}:${toolNameMaps.toOriginal.size}`, toolNameMaps.toOriginal.size);
+  }
+
+  toolNameMaps.toUpstream.set(original, upstream);
+  toolNameMaps.toOriginal.set(upstream, original);
+  return upstream;
+}
+
+function originalToolName(upstreamName, toolNameMaps) {
+  return toolNameMaps?.toOriginal?.get(upstreamName) || upstreamName;
+}
+
+function isValidOpenAiToolName(name) {
+  return /^[A-Za-z0-9_-]{1,64}$/.test(String(name || ""));
+}
+
+function shortToolName(name, index) {
+  const digest = crypto.createHash("sha1").update(String(name || "")).digest("hex").slice(0, 12);
+  return `tool_${index}_${digest}`;
+}
+
+function anthropicToolsToOpenAI(tools, options = {}) {
   if (!Array.isArray(tools) || tools.length === 0) {
     return undefined;
   }
+  const toolNameMaps = options.toolNameMaps || createToolNameMaps();
+  const strict = options.strict === true;
   return tools
     .filter((tool) => tool && typeof tool.name === "string")
     .map((tool) => ({
       type: "function",
       function: {
-        name: tool.name,
+        name: upstreamToolName(tool.name, toolNameMaps),
         description: tool.description || "",
-        parameters: tool.input_schema || { type: "object", properties: {} },
+        parameters: strict ? sanitizeJsonSchema(tool.input_schema || { type: "object", properties: {} }) : tool.input_schema || { type: "object", properties: {} },
+        ...(strict ? { strict: true } : {}),
       },
     }));
 }
 
-function buildUpstreamBody(body) {
+function sanitizeJsonSchema(schema) {
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) {
+    return { type: "object", properties: {}, additionalProperties: false };
+  }
+  const allowed = new Set(["type", "properties", "required", "description", "items", "enum", "minimum", "maximum", "minLength", "maxLength", "minItems", "maxItems"]);
+  const out = {};
+  for (const [key, value] of Object.entries(schema)) {
+    if (!allowed.has(key)) {
+      continue;
+    }
+    if (key === "properties" && value && typeof value === "object" && !Array.isArray(value)) {
+      out.properties = {};
+      for (const [propName, propSchema] of Object.entries(value)) {
+        out.properties[propName] = sanitizeJsonSchema(propSchema);
+      }
+    } else if (key === "items") {
+      out.items = sanitizeJsonSchema(value);
+    } else {
+      out[key] = value;
+    }
+  }
+  if (out.type === "object" || out.properties) {
+    out.type = out.type || "object";
+    out.properties = out.properties || {};
+    out.additionalProperties = false;
+  }
+  return out;
+}
+
+function openAiToolChoice(toolChoice, toolNameMaps) {
+  if (!toolChoice) {
+    return "auto";
+  }
+  if (typeof toolChoice === "string") {
+    return toolChoice === "any" ? "required" : toolChoice;
+  }
+  if (typeof toolChoice !== "object") {
+    return "auto";
+  }
+  if (toolChoice.type === "auto") {
+    return "auto";
+  }
+  if (toolChoice.type === "none") {
+    return "none";
+  }
+  if (toolChoice.type === "any") {
+    return "required";
+  }
+  if (toolChoice.type === "tool" && typeof toolChoice.name === "string") {
+    return {
+      type: "function",
+      function: { name: upstreamToolName(toolChoice.name, toolNameMaps) },
+    };
+  }
+  return "auto";
+}
+
+function buildUpstreamRequest(body, options = {}) {
   const model = upstreamModel(body.model);
   const thinking = resolveUpstreamThinking(body);
   const maxTokens = normalizeMaxTokens(body.max_tokens, thinking);
+  const toolMode = resolveToolMode(options.toolMode);
+  const toolHistoryMode = resolveToolHistoryMode(options.toolHistoryMode);
+  const toolNameMaps = options.toolNameMaps || createToolNameMaps();
   const upstream = {
     model,
-    messages: anthropicMessagesToOpenAI(body),
+    messages: anthropicMessagesToOpenAI(body, { toolMode, toolHistoryMode, toolNameMaps }),
     stream: body.stream === true,
     temperature: typeof body.temperature === "number" ? body.temperature : undefined,
     max_tokens: maxTokens,
   };
 
-  const shouldForwardTools = process.env.CLAUDE_SZTU_FORWARD_TOOLS === "1";
-  const tools = shouldForwardTools ? anthropicToolsToOpenAI(body.tools) : undefined;
+  const tools = isNativeToolMode(toolMode)
+    ? anthropicToolsToOpenAI(body.tools, { toolNameMaps, strict: toolMode === "strict" })
+    : undefined;
   if (tools) {
     upstream.tools = tools;
-    upstream.tool_choice = body.tool_choice ? "auto" : "auto";
+    upstream.tool_choice = openAiToolChoice(body.tool_choice, toolNameMaps);
   }
 
   upstream.chat_template_kwargs = chatTemplateKwargs(model, thinking);
@@ -444,7 +589,11 @@ function buildUpstreamBody(body) {
   }
 
   Object.keys(upstream).forEach((key) => upstream[key] === undefined && delete upstream[key]);
-  return upstream;
+  return { upstreamBody: upstream, toolMode, toolHistoryMode, toolNameMaps, forwardedToolCount: tools?.length || 0 };
+}
+
+function buildUpstreamBody(body, options = {}) {
+  return buildUpstreamRequest(body, options).upstreamBody;
 }
 
 function writeJson(res, status, payload) {
@@ -466,25 +615,39 @@ function stopReason(reason) {
   return "end_turn";
 }
 
-function toAnthropicMessage(payload, requestedModel, tools, requestId) {
+function openAiToolCallsToAnthropic(toolCalls, toolNameMaps) {
+  return (Array.isArray(toolCalls) ? toolCalls : [])
+    .map((toolCall) => {
+      const upstreamName = toolCall?.function?.name || toolCall?.name;
+      if (!upstreamName) {
+        return null;
+      }
+      return {
+        type: "tool_use",
+        id: toolCall.id || `toolu_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
+        name: originalToolName(upstreamName, toolNameMaps),
+        input: safeToolInput(toolCall.function?.arguments ?? toolCall.arguments),
+      };
+    })
+    .filter(Boolean);
+}
+
+function toAnthropicMessage(payload, requestedModel, tools, requestId, options = {}) {
   const choice = payload?.choices?.[0] || {};
   const message = choice.message || {};
   const content = [];
-  const parsedTools = parseToolsWithLog(message.content, tools, requestId, false);
+  const nativeTools = openAiToolCallsToAnthropic(message.tool_calls, options.toolNameMaps);
+  const parsedTools = nativeTools.length > 0 ? [] : parseToolsWithLog(message.content, tools, requestId, false);
 
-  if (parsedTools.length > 0) {
+  if (nativeTools.length > 0) {
+    if (typeof message.content === "string" && message.content) {
+      content.push({ type: "text", text: message.content });
+    }
+    content.push(...nativeTools);
+  } else if (parsedTools.length > 0) {
     content.push(...parsedTools);
   } else if (typeof message.content === "string" && message.content) {
     content.push({ type: "text", text: message.content });
-  }
-
-  for (const toolCall of message.tool_calls || []) {
-    content.push({
-      type: "tool_use",
-      id: toolCall.id,
-      name: toolCall.function?.name,
-      input: safeJson(toolCall.function?.arguments),
-    });
   }
 
   return {
@@ -493,7 +656,7 @@ function toAnthropicMessage(payload, requestedModel, tools, requestId) {
     role: "assistant",
     model: requestedModel || payload?.model || DEFAULT_MODEL,
     content,
-    stop_reason: parsedTools.length > 0 || (message.tool_calls || []).length > 0 ? "tool_use" : stopReason(choice.finish_reason),
+    stop_reason: parsedTools.length > 0 || nativeTools.length > 0 ? "tool_use" : stopReason(choice.finish_reason),
     stop_sequence: null,
     usage: {
       input_tokens: payload?.usage?.prompt_tokens || 0,
@@ -617,6 +780,13 @@ function safeJson(text) {
   }
 }
 
+function safeToolInput(value) {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    return value;
+  }
+  return safeJson(value);
+}
+
 function writeSse(res, event, data) {
   res.write(`event: ${event}\n`);
   res.write(`data: ${JSON.stringify(data)}\n\n`);
@@ -638,7 +808,7 @@ function readStreamChunk(reader) {
   });
 }
 
-function streamAnthropicFromUpstream(res, upstreamRes, requestedModel, tools, requestId, startedAt) {
+function streamAnthropicFromUpstream(res, upstreamRes, requestedModel, tools, requestId, startedAt, options = {}) {
   const id = `msg_${Date.now()}`;
   const createdMessage = {
     type: "message_start",
@@ -779,15 +949,19 @@ function streamAnthropicFromUpstream(res, upstreamRes, requestedModel, tools, re
         bufferPreview: preview(buffer, 1000),
       });
     }
-    const nativeTools = [...nativeToolCalls.entries()]
+    const nativeTools = openAiToolCallsToAnthropic(
+      [...nativeToolCalls.entries()]
       .sort((a, b) => a[0] - b[0])
       .map(([, toolCall]) => ({
-        type: "tool_use",
         id: toolCall.id,
-        name: toolCall.name,
-        input: safeJson(toolCall.arguments),
+        function: {
+          name: toolCall.name,
+          arguments: toolCall.arguments,
+        },
       }))
-      .filter((toolCall) => toolCall.name);
+      .filter((toolCall) => toolCall.function.name),
+      options.toolNameMaps,
+    );
     const parsedTools = nativeTools.length > 0 ? nativeTools : parseToolsWithLog(text, tools, requestId, true);
     if (parsedTools.length > 0) {
       parsedTools.forEach((parsedTool, index) => {
@@ -837,6 +1011,8 @@ function streamAnthropicFromUpstream(res, upstreamRes, requestedModel, tools, re
       status: upstreamRes.status,
       stop_reason: stop,
       usage,
+      nativeToolCalls: nativeTools.length,
+      fallbackParserUsed: nativeTools.length === 0 && parsedTools.length > 0,
       textChars: text.length,
       durationMs: durationMs(startedAt),
     });
@@ -859,7 +1035,8 @@ function proxyMessages(req, res, body) {
     return;
   }
 
-  const upstreamBody = buildUpstreamBody(body);
+  const upstreamRequest = buildUpstreamRequest(body);
+  const { upstreamBody, toolMode, toolHistoryMode, toolNameMaps, forwardedToolCount } = upstreamRequest;
   const upstreamThinking = resolveUpstreamThinking(body);
   log("request", {
     requestId,
@@ -870,6 +1047,9 @@ function proxyMessages(req, res, body) {
     upstreamBytes: Buffer.byteLength(JSON.stringify(upstreamBody)),
     client_thinking: body?.thinking?.type,
     upstream_thinking: upstreamThinking,
+    toolMode,
+    toolHistoryMode,
+    forwardedToolCount,
   });
 
   const payload = JSON.stringify(upstreamBody);
@@ -912,7 +1092,7 @@ function proxyMessages(req, res, body) {
           writeJson(res, 502, { error: { type: "api_error", message: "missing upstream stream body" } });
           return;
         }
-        streamAnthropicFromUpstream(res, upstreamRes, body.model, body.tools, requestId, startedAt);
+        streamAnthropicFromUpstream(res, upstreamRes, body.model, body.tools, requestId, startedAt, { toolNameMaps, toolMode });
         return;
       }
 
@@ -933,13 +1113,15 @@ function proxyMessages(req, res, body) {
         return;
       }
       const data = JSON.parse(text);
-      const anthropic = toAnthropicMessage(data, body.model, body.tools, requestId);
+      const anthropic = toAnthropicMessage(data, body.model, body.tools, requestId, { toolNameMaps, toolMode });
       log("response", {
         requestId,
         status: upstreamRes.status,
         stop_reason: anthropic.stop_reason,
         usage: anthropic.usage,
         contentTypes: anthropic.content.map((part) => part.type),
+        toolMode,
+        nativeToolCalls: anthropic.content.filter((part) => part.type === "tool_use").length,
         durationMs: durationMs(startedAt),
       });
       writeJson(res, 200, anthropic);
@@ -1001,6 +1183,8 @@ function startServer() {
       streamParseChars: STREAM_PARSE_CHARS,
       upstreamRetryAttempts: UPSTREAM_RETRY_ATTEMPTS,
       failureStatus: FAILURE_STATUS,
+      defaultToolMode: resolveToolMode(),
+      defaultToolHistoryMode: resolveToolHistoryMode(),
     });
   });
 
@@ -1030,13 +1214,19 @@ if (require.main === module) {
 module.exports = {
   anthropicMessagesToOpenAI,
   anthropicToolsToPrompt,
+  anthropicToolsToOpenAI,
   buildUpstreamBody,
+  buildUpstreamRequest,
   countAnthropicInputTokens,
   contentToText,
   boundedToolParseText,
+  createToolNameMaps,
+  resolveToolHistoryMode,
+  resolveToolMode,
   resolveDeepseekThinking,
   selectRelevantTools,
   startServer,
   toAnthropicMessage,
+  upstreamToolName,
   userIntentText,
 };

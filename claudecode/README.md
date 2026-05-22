@@ -18,9 +18,11 @@ node .\claudecode\claudecode-proxy.js
 
 - 所有 Claude 模型名统一路由到 `deepseek-v4-pro`
 - 推理按 **CC 每次请求的 `thinking` 字段** 映射：`enabled` / `adaptive` → 开，`disabled` → 关；未带时默认开启
-- 工具桥接支持多种 DeepSeek 输出格式（见 `docs/implementation-notes.md` 的 Tool Output Formats）
-- 解析后按 CC 的 `input_schema.properties` 过滤字段，避免模型编造 `limit` 等非法参数
-- 「总结 / 项目结构」类提示优先注入 Read、Glob、Grep，减少乱用 Bash
+- 工具桥接默认使用 SZTU/OpenAI-compatible 原生 `tool_calls`，再转换回 Anthropic `tool_use`
+- `CLAUDE_SZTU_TOOL_MODE=prompt` 可回退到旧的 prompt-mediated XML/JSON parser
+- `CLAUDE_SZTU_TOOL_HISTORY_MODE=text` 是默认值：SZTU 目前拒绝历史消息里的 assistant `tool_calls` / `role=tool`
+- parser fallback 仍支持多种 DeepSeek/GLM 文本工具调用格式（见 `docs/implementation-notes.md`）
+- 原生工具名不满足 OpenAI-compatible 限制时会短名映射，并在返回 Claude Code 前恢复原名
 
 ## 测试
 
@@ -36,10 +38,11 @@ node .\scripts\test-api.js claudecode
 
 | event | 含义 |
 |-------|------|
-| `request` | 客户端与上游摘要；含 `client.thinking`、`upstream.chat_template_kwargs` |
-| `tool-parse-hit` | 模型文本已转为 `tool_use`；看 `matchedFormat`、`inputKeys`、`inputPreview`、`strippedKeys` |
-| `tool-parse-miss` | 像工具调用但未解析成功；看 `modelTextPreview`、`rejected` |
-| `request` | 含 `client_thinking`、`deepseek_thinking` 与上下游摘要 |
+| `request` | 客户端与上游摘要；含 `toolMode`、`toolHistoryMode`、`forwardedToolCount`、`upstream.chat_template_kwargs` |
+| `response` | 非流式响应摘要；含 `nativeToolCalls` |
+| `stream-response` | 流式响应摘要；含 `nativeToolCalls`、`fallbackParserUsed` |
+| `tool-parse-hit` | fallback parser 将模型文本转为 `tool_use`；看 `matchedFormat`、`inputKeys`、`strippedKeys` |
+| `tool-parse-miss` | fallback parser 发现疑似工具调用但未解析成功；看 `modelTextPreview`、`rejected` |
 | `upstream-error-response` | SZTU/APISIX 上游错误（如 502） |
 
 ```powershell

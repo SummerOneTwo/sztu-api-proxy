@@ -2,11 +2,14 @@ const assert = require("assert");
 const {
   anthropicMessagesToOpenAI,
   anthropicToolsToPrompt,
+  anthropicToolsToOpenAI,
   countAnthropicInputTokens,
   boundedToolParseText,
   buildUpstreamBody,
+  buildUpstreamRequest,
   selectRelevantTools,
   toAnthropicMessage,
+  upstreamToolName,
   userIntentText,
 } = require("../claudecode/claudecode-proxy");
 
@@ -130,6 +133,29 @@ const prompt = anthropicToolsToPrompt(tools, messages);
 assert(prompt.includes("- Write:"), "tool prompt should still advertise Write after a tool_result");
 assert(prompt.includes("- Bash:"), "tool prompt should still advertise Bash after a tool_result");
 
+const nativeUpstream = buildUpstreamBody({
+  tools,
+  messages: [{ role: "user", content: "请使用 Read 工具读取 CLAUDE.md。只发工具调用。" }],
+  max_tokens: 512,
+}, { toolMode: "native" });
+assert(nativeUpstream.tools, "native mode should forward OpenAI tools upstream");
+assert.strictEqual(nativeUpstream.tool_choice, "auto", "native mode should use OpenAI auto tool choice");
+assert(
+  !nativeUpstream.messages.some((message) => String(message.content || "").includes("<tool_call>")),
+  "native mode should not inject prompt-mediated XML tool instructions",
+);
+
+const promptUpstream = buildUpstreamBody({
+  tools,
+  messages: [{ role: "user", content: "请使用 Read 工具读取 CLAUDE.md。只发工具调用。" }],
+  max_tokens: 512,
+}, { toolMode: "prompt" });
+assert(!promptUpstream.tools, "prompt mode should not forward OpenAI tools upstream");
+assert(
+  promptUpstream.messages.some((message) => String(message.content || "").includes("<tool_call>")),
+  "prompt mode should keep XML tool instructions for parser fallback",
+);
+
 const upstreamThinkingBody = buildUpstreamBody({
   model: "claude-3-5-haiku-latest",
   messages: [{ role: "user", content: "请只回复 OK" }],
@@ -161,16 +187,36 @@ const upstreamNoThinkingBody = buildUpstreamBody({
   thinking: { type: "disabled" },
 });
 assert.strictEqual(upstreamNoThinkingBody.max_tokens, 128, "disabled thinking should preserve the requested token budget");
-const upstreamMessages = anthropicMessagesToOpenAI({ tools, messages });
-const toolResultMessage = upstreamMessages.find((message) => message.content.includes("Tool result:\ntotal 0"));
-assert(toolResultMessage, "tool result should be forwarded into OpenAI history");
+const upstreamMessages = anthropicMessagesToOpenAI({ tools, messages }, { toolMode: "native" });
+assert(
+  !upstreamMessages.some((message) => Array.isArray(message.tool_calls)),
+  "default native mode should not send assistant tool_calls in history because SZTU rejects them",
+);
+const nativeTextToolResultMessage = upstreamMessages.find((message) => String(message.content || "").includes("Tool result:\ntotal 0"));
+assert(nativeTextToolResultMessage, "default native mode should use SZTU-compatible text tool_result history");
+
+const structuredUpstreamMessages = anthropicMessagesToOpenAI(
+  { tools, messages },
+  { toolMode: "native", toolHistoryMode: "structured" },
+);
+const assistantToolCallMessage = structuredUpstreamMessages.find((message) => Array.isArray(message.tool_calls));
+assert(assistantToolCallMessage, "structured history mode should preserve assistant tool_use as OpenAI tool_calls");
+assert.strictEqual(assistantToolCallMessage.tool_calls[0].function.name, "Bash", "structured history mode should preserve built-in tool name");
+const structuredToolResultMessage = structuredUpstreamMessages.find((message) => message.role === "tool");
+assert(structuredToolResultMessage, "structured history mode should forward tool_result as OpenAI tool role");
+assert.strictEqual(structuredToolResultMessage.tool_call_id, "toolu_1", "structured tool result should preserve tool_call_id");
+assert.strictEqual(structuredToolResultMessage.content, "total 0", "structured tool result content should be plain string");
+
+const promptUpstreamMessages = anthropicMessagesToOpenAI({ tools, messages }, { toolMode: "prompt" });
+const toolResultMessage = promptUpstreamMessages.find((message) => String(message.content || "").includes("Tool result:\ntotal 0"));
+assert(toolResultMessage, "prompt mode should keep tool_result as user text");
 assert(
   toolResultMessage.content.includes("request exactly one tool call"),
-  "tool result prompt should allow follow-up tool calls",
+  "prompt-mode tool result should allow follow-up tool calls",
 );
 assert(
   !toolResultMessage.content.includes("Answer the user's original request directly"),
-  "tool result prompt should not force a final answer",
+  "prompt-mode tool result should not force a final answer",
 );
 
 const longThinking = `${"x".repeat(70000)}\n<tool_call name="Read"><file_path>README.md</file_path></tool_call>`;
@@ -187,6 +233,71 @@ const countTokens = countAnthropicInputTokens({
   tools,
 });
 assert(countTokens > 0, "count token estimator should return a positive token count");
+
+const longToolName = `mcp__very_long_server_name__${"x".repeat(80)}`;
+const longTool = {
+  name: longToolName,
+  description: "Long MCP tool name",
+  input_schema: {
+    type: "object",
+    properties: { path: { type: "string" } },
+    required: ["path"],
+  },
+};
+const longToolRequest = buildUpstreamRequest({
+  messages: [{ role: "user", content: "use long tool" }],
+  tools: [longTool],
+}, { toolMode: "native" });
+assert.strictEqual(longToolRequest.toolHistoryMode, "text", "SZTU-compatible text tool history should be the default");
+const shortenedName = longToolRequest.upstreamBody.tools[0].function.name;
+assert.notStrictEqual(shortenedName, longToolName, "long tool names should be shortened for OpenAI-compatible providers");
+assert(/^[A-Za-z0-9_-]{1,64}$/.test(shortenedName), "shortened tool name should satisfy OpenAI tool-name limits");
+assert.strictEqual(
+  upstreamToolName(longToolName, longToolRequest.toolNameMaps),
+  shortenedName,
+  "tool name mapping should be stable within one request",
+);
+
+const translatedLongTool = toAnthropicMessage(
+  {
+    id: "msg_long_tool",
+    choices: [
+      {
+        message: {
+          tool_calls: [
+            {
+              id: "call_long",
+              type: "function",
+              function: { name: shortenedName, arguments: "{\"path\":\"README.md\"}" },
+            },
+          ],
+        },
+        finish_reason: "tool_calls",
+      },
+    ],
+    usage: { prompt_tokens: 1, completion_tokens: 1 },
+  },
+  "deepseek-v4-pro",
+  [longTool],
+  "test_long_tool",
+  { toolNameMaps: longToolRequest.toolNameMaps },
+);
+assert.strictEqual(translatedLongTool.content[0].name, longToolName, "OpenAI tool calls should restore original Claude tool name");
+assert.deepStrictEqual(translatedLongTool.content[0].input, { path: "README.md" }, "OpenAI tool arguments should parse as tool input");
+
+const strictTools = anthropicToolsToOpenAI([{
+  name: "Read",
+  description: "Read file",
+  input_schema: {
+    type: "object",
+    properties: { file_path: { type: "string", description: "path", extra: true } },
+    required: ["file_path"],
+    unsupported: true,
+  },
+}], { strict: true });
+assert.strictEqual(strictTools[0].function.strict, true, "strict mode should mark function tools strict");
+assert.strictEqual(strictTools[0].function.parameters.additionalProperties, false, "strict object schema should forbid extra fields");
+assert.strictEqual(strictTools[0].function.parameters.unsupported, undefined, "strict schema should drop unsupported top-level fields");
 
 const multiToolMessage = toAnthropicMessage(
   {
