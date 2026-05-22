@@ -35,6 +35,54 @@ const tools = [
       properties: { pattern: { type: "string" }, path: { type: "string" } },
     },
   },
+  {
+    name: "mcp__autocode__file_read",
+    input_schema: {
+      type: "object",
+      required: ["path"],
+      properties: { path: { type: "string" }, problem_dir: { type: "string" } },
+    },
+  },
+  {
+    name: "mcp__autocode__problem_create",
+    input_schema: {
+      type: "object",
+      required: ["problem_dir", "problem_name"],
+      properties: { problem_dir: { type: "string" }, problem_name: { type: "string" }, interactive: { type: "boolean" } },
+    },
+  },
+  {
+    name: "mcp__autocode__file_save",
+    input_schema: {
+      type: "object",
+      required: ["problem_dir", "path", "content"],
+      properties: { problem_dir: { type: "string" }, path: { type: "string" }, content: { type: "string" } },
+    },
+  },
+  {
+    name: "mcp__autocode__solution_audit_std",
+    input_schema: {
+      type: "object",
+      required: ["problem_dir"],
+      properties: { problem_dir: { type: "string" }, constraints: { type: "object" } },
+    },
+  },
+  {
+    name: "mcp__autocode__stress_test_run",
+    input_schema: {
+      type: "object",
+      required: ["problem_dir"],
+      properties: { problem_dir: { type: "string" } },
+    },
+  },
+  {
+    name: "mcp__autocode__problem_pack_polygon",
+    input_schema: {
+      type: "object",
+      required: ["problem_dir"],
+      properties: { problem_dir: { type: "string" } },
+    },
+  },
 ];
 
 const winPath = String.raw`C:\userProgram\program\sztu-api-proxy\codebuddy\README.md`;
@@ -141,6 +189,94 @@ const cases = [
     expect: { name: "Read", input: { file_path: winPath } },
   },
   {
+    name: "deepseek self-closing parameter value",
+    text: '<tool_call name="mcp__autocode__problem_create"><parameter name="problem_dir" value="C:/tmp/p"/><parameter name="problem_name" value="DeepSeek Smoke Test"/></tool_call>',
+    expect: {
+      name: "mcp__autocode__problem_create",
+      input: { problem_dir: "C:/tmp/p", problem_name: "DeepSeek Smoke Test" },
+    },
+  },
+  {
+    name: "deepseek self-closing param value file save",
+    text: '<tool_call name="mcp__autocode__file_save"><param name="problem_dir" value="C:/tmp/p"/><param name="path" value="statements/README.md"/><param name="content" value="# Title"/></tool_call>',
+    expect: {
+      name: "mcp__autocode__file_save",
+      input: { problem_dir: "C:/tmp/p", path: "statements/README.md", content: "# Title" },
+    },
+  },
+  {
+    name: "deepseek self-closing param content attr file save",
+    text: '<tool_call name="mcp__autocode__file_save"><param name="problem_dir" content="C:/tmp/p"/><param name="path" content="statements/README.md"/><param name="content" content="# Title"/></tool_call>',
+    expect: {
+      name: "mcp__autocode__file_save",
+      input: { problem_dir: "C:/tmp/p", path: "statements/README.md", content: "# Title" },
+    },
+  },
+  {
+    name: "deepseek self-closing param content attr with cxx quotes file save",
+    text: '<tool_call name="mcp__autocode__file_save"><param name="problem_dir" content="C:/tmp/p"/><param name="path" content="files/val.cpp"/><param name="content" content="#include <bits/stdc++.h>\nusing namespace std;\nint main() { if (1 > 0) { cerr << "ERROR" << endl; } return 0; }"/></tool_call>',
+    expect: {
+      name: "mcp__autocode__file_save",
+      input: {
+        problem_dir: "C:/tmp/p",
+        path: "files/val.cpp",
+        content: '#include <bits/stdc++.h>\nusing namespace std;\nint main() { if (1 > 0) { cerr << "ERROR" << endl; } return 0; }',
+      },
+    },
+  },
+  {
+    name: "deepseek param content attr with body file save",
+    text: '<tool_call name="mcp__autocode__file_save"><parameter name="path" content="statements/README.md">statements/README.md</parameter><parameter name="content" content="# Title\n\nBody"># Title\n\nBody</parameter><parameter name="problem_dir" content="C:/tmp/p">C:/tmp/p</parameter></tool_call>',
+    expect: {
+      name: "mcp__autocode__file_save",
+      input: { problem_dir: "C:/tmp/p", path: "statements/README.md", content: "# Title\n\nBody" },
+    },
+  },
+  {
+    name: "deepseek malformed unclosed content parameter preserves following problem_dir",
+    text: '<tool_call name="mcp__autocode__file_save"><parameter name="path" content="statements/README.md">statements/README.md</parameter><parameter name="content" content="# Title\n\nBody"><parameter name="problem_dir" content="C:/tmp/p">C:/tmp/p</parameter></tool_call>',
+    expect: {
+      name: "mcp__autocode__file_save",
+      input: { problem_dir: "C:/tmp/p", path: "statements/README.md", content: "# Title\n\nBody" },
+    },
+  },
+  {
+    name: "deepseek malformed unclosed value attributes file save",
+    text: '<tool_call name="mcp__autocode__file_save"><parameter name="path" value="files/gen.cpp</parameter><parameter name="content" value="#include <bits/stdc++.h>\nusing namespace std;\nint main() { vector<vector<int>> a; cout << \"ok\" << \"\\n\"; return 0; }\n</parameter><parameter name="problem_dir" value="C:/tmp/p/Maximum Equal Pair Sum</parameter></tool_call>',
+    expect: {
+      name: "mcp__autocode__file_save",
+      input: {
+        problem_dir: "C:/tmp/p/Maximum Equal Pair Sum",
+        path: "files/gen.cpp",
+        content: '#include <bits/stdc++.h>\nusing namespace std;\nint main() { vector<vector<int>> a; cout << "ok" << "\\n"; return 0; }',
+      },
+    },
+  },
+  {
+    name: "deepseek self-closing param value with greater-than sign",
+    text: '<tool_call name="mcp__autocode__file_save"><param name="problem_dir" value="C:/tmp/p"/><param name="path" value="statements/tutorial.md"/><param name="content" value="## 解法\n出现次数 >= 2 的最大值。"/></tool_call>',
+    expect: {
+      name: "mcp__autocode__file_save",
+      input: { problem_dir: "C:/tmp/p", path: "statements/tutorial.md", content: "## 解法\n出现次数 >= 2 的最大值。" },
+    },
+  },
+  {
+    name: "deepseek name parameter value pair mcp stress run",
+    text: '<tool_call> <name>mcp__autocode__stress_test_run</name> <parameter>problem_dir</parameter> <value>C:/tmp/p/Maximum Equal Pair Sum</value> </parameter> </tool_call>',
+    expect: {
+      name: "mcp__autocode__stress_test_run",
+      input: { problem_dir: "C:/tmp/p/Maximum Equal Pair Sum" },
+    },
+  },
+  {
+    name: "deepseek broken quoted parameter value mcp pack polygon",
+    text: '<tool_call name="mcp__autocode__problem_pack_polygon"> <parameter name="problem_dir" value="C:\\userProgram\\program\\SZTUCPC\\.cache\\autocode-deepseek-flow4-20260522-145000\\Maximum Equal Pair Sum</parameter> </tool_call>',
+    expect: {
+      name: "mcp__autocode__problem_pack_polygon",
+      input: { problem_dir: "C:\\userProgram\\program\\SZTUCPC\\.cache\\autocode-deepseek-flow4-20260522-145000\\Maximum Equal Pair Sum" },
+    },
+  },
+  {
     name: "unnamed tool call inferred bash parameter",
     text: `<tool_call><parameter name="command">"node --version"</parameter><parameter name="description">Check Node</parameter></tool_call>`,
     expect: { name: "Bash", input: { command: "node --version" } },
@@ -184,6 +320,127 @@ const cases = [
     name: "named xml child elements bash strips description",
     text: '<tool_call name="Bash"><command>find .</command><description>List files</description></tool_call>',
     expect: { name: "Bash", input: { command: "find ." } },
+  },
+  {
+    name: "named xml input wrapper mcp file read",
+    text: `<tool_call name="mcp__autocode__file_read"><input><path>${winPath}</path><problem_dir>C:\\userProgram\\program\\SZTUCPC\\.cache\\autocode-proxy-smoke</problem_dir></input></tool_call>`,
+    expect: {
+      name: "mcp__autocode__file_read",
+      input: {
+        path: winPath,
+        problem_dir: "C:\\userProgram\\program\\SZTUCPC\\.cache\\autocode-proxy-smoke",
+      },
+    },
+  },
+  {
+    name: "name child parameter json mcp file read",
+    text: `<tool_call><name>mcp__autocode__file_read</name><parameter>{"path":"${winPath.replace(/\\/g, "\\\\")}"}</parameter></tool_call>`,
+    expect: { name: "mcp__autocode__file_read", input: { path: winPath } },
+  },
+  {
+    name: "function style mcp boolean with closing paren",
+    text: '<tool_call>mcp__autocode__problem_create(problem_dir="C:/tmp/p", problem_name="Square Number", interactive=false)</tool_call>',
+    expect: { name: "mcp__autocode__problem_create", input: { problem_dir: "C:/tmp/p", problem_name: "Square Number", interactive: false } },
+  },
+  {
+    name: "function style mcp boolean with dangling arg tag",
+    text: '<tool_call>mcp__autocode__problem_create(problem_dir="C:/tmp/p", problem_name="Square Number", interactive=false)</arg_value>',
+    expect: { name: "mcp__autocode__problem_create", input: { problem_dir: "C:/tmp/p", problem_name: "Square Number", interactive: false } },
+  },
+  {
+    name: "deepseek object attribute in single quotes",
+    text: '<tool_call name="mcp__autocode__solution_audit_std"><parameter name="problem_dir" value="C:/tmp/p"/><parameter name="constraints" value=\'{"time_limit_ms": 1000, "memory_limit_mb": 256, "n_max": 10000000}\'/></tool_call>',
+    expect: {
+      name: "mcp__autocode__solution_audit_std",
+      input: {
+        problem_dir: "C:/tmp/p",
+        constraints: { time_limit_ms: 1000, memory_limit_mb: 256, n_max: 10000000 },
+      },
+    },
+  },
+  {
+    name: "deepseek calling fenced json mcp problem create",
+    text: '**Calling:** `mcp__autocode__problem_create`\n```json\n{"problem_dir":"C:/tmp/p","problem_name":"DeepSeek Smoke Test","interactive":false}\n```',
+    expect: {
+      name: "mcp__autocode__problem_create",
+      input: { problem_dir: "C:/tmp/p", problem_name: "DeepSeek Smoke Test", interactive: false },
+    },
+  },
+  {
+    name: "deepseek fenced tool arguments json mcp problem create",
+    text: '```json\n{"tool":"mcp__autocode__problem_create","arguments":{"problem_dir":"C:/tmp/p","problem_name":"DeepSeek Smoke Test","interactive":false}}\n```',
+    expect: {
+      name: "mcp__autocode__problem_create",
+      input: { problem_dir: "C:/tmp/p", problem_name: "DeepSeek Smoke Test", interactive: false },
+    },
+  },
+  {
+    name: "glm malformed nested arg mcp file save",
+    text: "<tool_call>mcp__autocode__file_save<tool_call>problem_dir</arg_key><arg_value>C:/tmp/p</arg_value><arg_key>path</arg_key><arg_value>solutions/sol.cpp</arg_value><arg_key>content</arg_key><arg_value>#include <iostream>\nint main(){}</arg_value></tool_call>",
+    expect: {
+      name: "mcp__autocode__file_save",
+      input: { problem_dir: "C:/tmp/p", path: "solutions/sol.cpp", content: "#include <iostream>\nint main(){}" },
+    },
+  },
+  {
+    name: "glm repeated prelude prefers complete mcp file save",
+    text: `<tool_call>mcp__autocode__file_save模板<tool_call>mcp__autocode__file_save参数<tool_call>mcp__autocode__file_save调用<tool_call>mcp__autocode__file_save<tool_call>mcp__autocode__file_save让我保存 README.md：<tool_call>mcp__autocode__file_save({"problem_dir":"C:/tmp/p","path":"statements/README.md","content":"# Square Number\\n\\nGiven an integer n, output n squared.\\n\\n## Output\\nPrint n*n.\\n"})</tool_call>`,
+    expect: {
+      name: "mcp__autocode__file_save",
+      input: {
+        problem_dir: "C:/tmp/p",
+        path: "statements/README.md",
+        content: "# Square Number\n\nGiven an integer n, output n squared.\n\n## Output\nPrint n*n.",
+      },
+    },
+  },
+  {
+    name: "glm jsonish mcp file_save keeps content with latex note",
+    text: `<tool_call>mcp__autocode__file_save{"path":"statements/README.md","problem_dir":"C:/tmp/p","content":"# Square Number ## Problem Given an integer $n$, output $n \\times n$. ## Constraints - $0 \\le n \\le 1\\,000\\,000\\,000$ Note: use 64-bit integer. ## Sample Output \`\`\` 25 \`\`\` "}`,
+    expect: {
+      name: "mcp__autocode__file_save",
+      input: {
+        problem_dir: "C:/tmp/p",
+        path: "statements/README.md",
+        content: "# Square Number ## Problem Given an integer $n$, output $n \\times n$. ## Constraints - $0 \\le n \\le 1\\,000\\,000\\,000$ Note: use 64-bit integer. ## Sample Output ``` 25 ```",
+      },
+    },
+  },
+  {
+    name: "deepseek file_save json keeps parsed path fields when repairing content",
+    text: `<tool_call name="mcp__autocode__file_save"> {"path":"statements/README.md","content":"# DeepSeek Complete Flow\\n\\nOutput a single integer: the maximum sum.\\n\\n\`\`\`\\n5\\n1 2 3 4 5\\n\`\`\`","problem_dir":"C:/tmp/p"} </tool_call>`,
+    expect: {
+      name: "mcp__autocode__file_save",
+      input: {
+        problem_dir: "C:/tmp/p",
+        path: "statements/README.md",
+        content: "# DeepSeek Complete Flow\n\nOutput a single integer: the maximum sum.\n\n```\n5\n1 2 3 4 5\n```",
+      },
+    },
+  },
+  {
+    name: "glm arg_value mcp file_save missing closing arg_key",
+    text: `<tool_call>mcp__autocode__file_save<tool_call>path<arg_value>statements/README.md<arg_key>content</arg_key><arg_value># Square Number\n\nBody</arg_value><arg_key>problem_dir<arg_value>C:/tmp/p</arg_value></tool_call>`,
+    expect: {
+      name: "mcp__autocode__file_save",
+      input: {
+        problem_dir: "C:/tmp/p",
+        path: "statements/README.md",
+        content: "# Square Number\n\nBody",
+      },
+    },
+  },
+  {
+    name: "glm arg_key mcp file_save mixed broken key tags",
+    text: `<tool_call>mcp__autocode__file_save<tool_call>path</arg_key><arg_value>solutions/sol.cpp<tool_call>content</arg_key><arg_value>#include <bits/stdc++.h>\nint main(){}</arg_value>problem_dir</arg_key><arg_value>C:/tmp/p</arg_value></tool_call>`,
+    expect: {
+      name: "mcp__autocode__file_save",
+      input: {
+        problem_dir: "C:/tmp/p",
+        path: "solutions/sol.cpp",
+        content: "#include <bits/stdc++.h>\nint main(){}",
+      },
+    },
   },
   {
     name: "repeated named xml child elements first read",
@@ -284,6 +541,12 @@ const repeatedNamedXmlTools = parseToolCallsText(
 assert.strictEqual(repeatedNamedXmlTools.length, 2, "repeated named xml should parse both tool calls");
 assert.deepStrictEqual(repeatedNamedXmlTools.map((tool) => tool.input.file_path), ["README.md", "CHANGELOG.md"]);
 
+const duplicateMcpTools = parseToolCallsText(
+  '<tool_call>mcp__autocode__problem_create{"problem_dir":"C:/tmp/p","problem_name":"Square Number","interactive":false}<tool_call>mcp__autocode__problem_create({"problem_dir":"C:/tmp/p","problem_name":"Square Number","interactive":false})',
+  tools,
+);
+assert.strictEqual(duplicateMcpTools.length, 1, "duplicate same-name MCP calls should collapse to one tool call");
+
 const inlineTools = parseToolCallsText(
   '<tool-calls><tool_use id="x">Bash: tree -L 2</tool_use><tool_use id="y">Read: package.json</tool_use></tool-calls>',
   tools,
@@ -318,6 +581,93 @@ assert.deepStrictEqual(
   { command: "find .", description: "List files" },
   "schema-allowed optional parameters should be preserved while unknown fields are stripped",
 );
+
+const pluginAutocodeTools = tools.map((tool) =>
+  tool.name === "mcp__autocode__problem_create"
+    ? { ...tool, name: "mcp__plugin_autocode_autocode__problem_create" }
+    : tool,
+);
+const pluginAutocodeAlias = parseToolCallText(
+  '```json\n{"tool":"mcp__autocode__problem_create","arguments":{"problem_dir":"C:/tmp/p","problem_name":"DeepSeek Smoke Test","interactive":false}}\n```',
+  pluginAutocodeTools,
+);
+assert(pluginAutocodeAlias, "short AutoCode MCP alias should parse with plugin-scoped tools");
+assert.deepStrictEqual(
+  pluginAutocodeAlias,
+  {
+    type: "tool_use",
+    id: pluginAutocodeAlias.id,
+    name: "mcp__plugin_autocode_autocode__problem_create",
+    input: { problem_dir: "C:/tmp/p", problem_name: "DeepSeek Smoke Test", interactive: false },
+  },
+  "short AutoCode MCP aliases should map to plugin-scoped Claude Code tool names",
+);
+const pluginAutocodeSelfClosing = parseToolCallText(
+  '<tool_call name="mcp__plugin_autocode_autocode__problem_create"><parameter name="problem_dir" value="C:/tmp/p"/><parameter name="problem_name" value="DeepSeek Smoke Test"/></tool_call>',
+  pluginAutocodeTools,
+);
+assert(pluginAutocodeSelfClosing, "plugin-scoped self-closing AutoCode tool call should parse");
+assert.deepStrictEqual(
+  pluginAutocodeSelfClosing.input,
+  { problem_dir: "C:/tmp/p", problem_name: "DeepSeek Smoke Test" },
+  "self-closing XML parameter value attributes should be preserved",
+);
+const pluginAutocodeFileSaveTools = tools.map((tool) =>
+  tool.name === "mcp__autocode__file_save"
+    ? { ...tool, name: "mcp__plugin_autocode_autocode__file_save" }
+    : tool,
+);
+const pluginAutocodeFileSave = parseToolCallText(
+  '<tool_call name="mcp__plugin_autocode_autocode__file_save"><param name="problem_dir" value="C:/tmp/p"/><param name="path" value="statements/README.md"/><param name="content" value="# Title"/></tool_call>',
+  pluginAutocodeFileSaveTools,
+);
+assert(pluginAutocodeFileSave, "plugin-scoped self-closing AutoCode file_save should parse");
+assert.deepStrictEqual(
+  pluginAutocodeFileSave.input,
+  { problem_dir: "C:/tmp/p", path: "statements/README.md", content: "# Title" },
+  "plugin-scoped file_save should parse param value attributes",
+);
+const pluginAutocodeFileSaveContentAttr = parseToolCallText(
+  '<tool_call name="mcp__plugin_autocode_autocode__file_save"><param name="problem_dir" content="C:/tmp/p"/><param name="path" content="statements/README.md"/><param name="content" content="# Title"/></tool_call>',
+  pluginAutocodeFileSaveTools,
+);
+assert(pluginAutocodeFileSaveContentAttr, "plugin-scoped self-closing AutoCode file_save content attrs should parse");
+assert.deepStrictEqual(
+  pluginAutocodeFileSaveContentAttr.input,
+  { problem_dir: "C:/tmp/p", path: "statements/README.md", content: "# Title" },
+  "plugin-scoped file_save should parse param content attributes",
+);
+
+const autocodeFileReadOnlyTools = tools.filter((tool) => tool.name === "mcp__autocode__file_read");
+const readAsAutocodeFileRead = parseToolCallText(
+  '<tool_call name="Read">{"file_path":"C:\\\\userProgram\\\\program\\\\SZTUCPC\\\\CLAUDE.md"}</tool_call>',
+  autocodeFileReadOnlyTools,
+);
+assert(readAsAutocodeFileRead, "Read should map to AutoCode file_read when only MCP file_read is allowed");
+assert.deepStrictEqual(
+  readAsAutocodeFileRead,
+  {
+    type: "tool_use",
+    id: readAsAutocodeFileRead.id,
+    name: "mcp__autocode__file_read",
+    input: { path: "C:\\userProgram\\program\\SZTUCPC\\CLAUDE.md" },
+  },
+  "Read file_path should become AutoCode file_read path",
+);
+
+const pluginAutocodeFileReadOnlyTools = autocodeFileReadOnlyTools.map((tool) => ({
+  ...tool,
+  name: "mcp__plugin_autocode_autocode__file_read",
+}));
+const readAsPluginAutocodeFileRead = parseToolCallText(
+  '<tool_call name="Read">{"file_path":"C:\\\\userProgram\\\\program\\\\SZTUCPC\\\\CLAUDE.md"}</tool_call>',
+  pluginAutocodeFileReadOnlyTools,
+);
+assert(readAsPluginAutocodeFileRead, "Read should map to plugin-scoped AutoCode file_read");
+assert.strictEqual(readAsPluginAutocodeFileRead.name, "mcp__plugin_autocode_autocode__file_read");
+assert.deepStrictEqual(readAsPluginAutocodeFileRead.input, {
+  path: "C:\\userProgram\\program\\SZTUCPC\\CLAUDE.md",
+});
 
 const misses = [
   {

@@ -13,10 +13,17 @@ const UPSTREAM_URL = process.env.SZTU_UPSTREAM_URL || "https://apiai.sztu.edu.cn
 const CLAUDE_DIR = __dirname;
 const RUNTIME_DIR = path.join(CLAUDE_DIR, ".runtime");
 const LOG_PATH = path.join(RUNTIME_DIR, "claudecode-proxy.log");
-const PID_PATH = path.join(RUNTIME_DIR, "claudecode-proxy.pid");
+const PID_PATH = path.join(RUNTIME_DIR, PORT === 8790 ? "claudecode-proxy.pid" : `claudecode-proxy-${PORT}.pid`);
 const DEFAULT_MODEL = process.env.SZTU_DEFAULT_MODEL || "deepseek-v4-pro";
-const DEFAULT_MAX_TOKENS = envNumber("SZTU_DEFAULT_MAX_TOKENS", 16384);
+const DEFAULT_MAX_TOKENS = envNumber("SZTU_DEFAULT_MAX_TOKENS", 32768);
 const MAX_TOKENS = envNumber("SZTU_MAX_TOKENS", 32768);
+const THINKING_MIN_MAX_TOKENS = envNumber("SZTU_THINKING_MIN_MAX_TOKENS", 10000);
+const UPSTREAM_TIMEOUT_MS = Math.max(1000, envNumber("CLAUDE_SZTU_UPSTREAM_TIMEOUT_MS", 180000));
+const STREAM_READ_TIMEOUT_MS = Math.max(1000, envNumber("CLAUDE_SZTU_STREAM_READ_TIMEOUT_MS", 180000));
+const STREAM_TOTAL_TIMEOUT_MS = Math.max(STREAM_READ_TIMEOUT_MS, envNumber("CLAUDE_SZTU_STREAM_TOTAL_TIMEOUT_MS", 300000));
+const STREAM_PARSE_CHARS = Math.max(4000, envNumber("CLAUDE_SZTU_STREAM_PARSE_CHARS", 60000));
+const UPSTREAM_RETRY_ATTEMPTS = Math.max(1, Math.trunc(envNumber("CLAUDE_SZTU_UPSTREAM_RETRY_ATTEMPTS", 1)));
+const FAILURE_STATUS = Math.max(400, Math.trunc(envNumber("CLAUDE_SZTU_FAILURE_STATUS", 424)));
 
 function resolveDeepseekThinking(body) {
   const config = body?.thinking;
@@ -50,22 +57,32 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+const resolveUpstreamThinking = resolveDeepseekThinking;
+
+function failureStatus() {
+  return FAILURE_STATUS;
+}
+
 async function fetchWithRetry(url, options) {
   let lastError;
-  for (let attempt = 1; attempt <= 3; attempt++) {
+  for (let attempt = 1; attempt <= UPSTREAM_RETRY_ATTEMPTS; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
     try {
-      const response = await fetch(url, options);
-      if (response.status < 500 || attempt === 3) {
+      const response = await fetch(url, { ...options, signal: controller.signal });
+      if (response.status < 500 || attempt === UPSTREAM_RETRY_ATTEMPTS) {
         return response;
       }
       const text = await response.text().catch(() => "");
       log("upstream-retryable-status", { attempt, status: response.status, bodyPreview: preview(text, 1000) });
     } catch (error) {
       lastError = error;
-      if (attempt === 3) {
+      if (attempt === UPSTREAM_RETRY_ATTEMPTS) {
         break;
       }
       log("upstream-retryable-error", { attempt, error });
+    } finally {
+      clearTimeout(timer);
     }
     await delay(500 * attempt);
   }
@@ -88,13 +105,17 @@ function readJson(req) {
   });
 }
 
-function normalizeMaxTokens(value) {
+function normalizeMaxTokens(value, thinking = false) {
   const n = Number(value);
   const configuredMax = Math.min(DEFAULT_MAX_TOKENS, MAX_TOKENS);
   if (!Number.isFinite(n) || n <= 0) {
     return configuredMax;
   }
-  return Math.min(Math.trunc(n), configuredMax);
+  const requested = Math.min(Math.trunc(n), configuredMax);
+  if (thinking) {
+    return Math.min(Math.max(requested, THINKING_MIN_MAX_TOKENS), configuredMax);
+  }
+  return requested;
 }
 
 function upstreamModel() {
@@ -255,6 +276,30 @@ function selectRelevantTools(tools, messages) {
 
   const wanted = new Set();
   const add = (...names) => names.forEach((name) => wanted.add(name.toLowerCase()));
+  const addMatching = (predicate) => {
+    for (const tool of Array.isArray(tools) ? tools : []) {
+      const name = String(tool?.name || "");
+      if (name && predicate(name.toLowerCase())) {
+        wanted.add(name.toLowerCase());
+      }
+    }
+  };
+  const explicitAutocodeNames = [...text.matchAll(/mcp__autocode__([a-z0-9_-]+)/g)].map((match) => match[1]);
+  if (explicitAutocodeNames.length > 0) {
+    const explicit = new Set(explicitAutocodeNames);
+    for (const tool of Array.isArray(tools) ? tools : []) {
+      const name = String(tool?.name || "");
+      const lower = name.toLowerCase();
+      const suffix = autocodeToolSuffix(lower);
+      if (!suffix) {
+        continue;
+      }
+      if (explicit.has(suffix)) {
+        wanted.add(lower);
+      }
+    }
+    return tools.filter((tool) => wanted.has(String(tool?.name || "").toLowerCase()));
+  }
 
   if (/(read|open|cat|查看|读取|阅读|打开|文件|file|agents\.md|readme|package\.json)/i.test(text)) {
     add("Read", "LS");
@@ -271,11 +316,73 @@ function selectRelevantTools(tools, messages) {
   if (/(总结|概览|项目|结构|目录|overview|summarize|structure|repo|codebase)/i.test(text)) {
     add("Read", "Glob", "Grep");
   }
+  if (/(autocode|mcp__autocode__|竞赛|出题|题目|polygon|validator|generator|checker|interactor|stress|对拍)/i.test(text)) {
+    let matchedAutocodeTool = false;
+    for (const tool of Array.isArray(tools) ? tools : []) {
+      const name = String(tool?.name || "");
+      const lower = name.toLowerCase();
+      const suffix = autocodeToolSuffix(lower);
+      if (!suffix) {
+        continue;
+      }
+      if (text.includes(lower) || text.includes(suffix)) {
+        wanted.add(lower);
+        matchedAutocodeTool = true;
+      }
+    }
+    if (!matchedAutocodeTool) {
+      addMatching((name) => Boolean(autocodeToolSuffix(name)));
+    }
+    add("Skill");
+  }
+  addMatching((name) => text.includes(name));
 
   if (wanted.size === 0) {
     return [];
   }
   return tools.filter((tool) => wanted.has(String(tool?.name || "").toLowerCase()));
+}
+
+function countAnthropicInputTokens(body) {
+  const parts = [];
+  if (typeof body?.system === "string") {
+    parts.push(body.system);
+  } else if (Array.isArray(body?.system)) {
+    parts.push(contentToText(body.system));
+  }
+  for (const message of Array.isArray(body?.messages) ? body.messages : []) {
+    parts.push(String(message?.role || ""));
+    parts.push(contentToText(message?.content));
+  }
+  if (Array.isArray(body?.tools)) {
+    parts.push(JSON.stringify(body.tools));
+  }
+  return estimateTokens(parts.filter(Boolean).join("\n"));
+}
+
+function estimateTokens(text) {
+  const source = String(text || "");
+  let ascii = 0;
+  let nonAscii = 0;
+  for (const char of source) {
+    if (char.charCodeAt(0) <= 0x7f) {
+      ascii++;
+    } else {
+      nonAscii++;
+    }
+  }
+  return Math.max(1, Math.ceil(ascii / 4 + nonAscii / 2));
+}
+
+function autocodeToolSuffix(name) {
+  const lower = String(name || "").toLowerCase();
+  if (lower.startsWith("mcp__autocode__")) {
+    return lower.slice("mcp__autocode__".length);
+  }
+  if (lower.startsWith("mcp__plugin_autocode_autocode__")) {
+    return lower.slice("mcp__plugin_autocode_autocode__".length);
+  }
+  return "";
 }
 
 function userIntentText(messages) {
@@ -313,7 +420,8 @@ function anthropicToolsToOpenAI(tools) {
 
 function buildUpstreamBody(body) {
   const model = upstreamModel(body.model);
-  const maxTokens = normalizeMaxTokens(body.max_tokens);
+  const thinking = resolveUpstreamThinking(body);
+  const maxTokens = normalizeMaxTokens(body.max_tokens, thinking);
   const upstream = {
     model,
     messages: anthropicMessagesToOpenAI(body),
@@ -329,7 +437,7 @@ function buildUpstreamBody(body) {
     upstream.tool_choice = body.tool_choice ? "auto" : "auto";
   }
 
-  upstream.chat_template_kwargs = chatTemplateKwargs(model, resolveDeepseekThinking(body));
+  upstream.chat_template_kwargs = chatTemplateKwargs(model, thinking);
 
   if (upstream.stream) {
     upstream.stream_options = { include_usage: true };
@@ -399,7 +507,8 @@ function parseToolWithLog(text, tools, requestId, stream) {
 }
 
 function parseToolsWithLog(text, tools, requestId, stream) {
-  const result = parseToolCallsDetailed(text, tools);
+  const parseSource = boundedToolParseText(text);
+  const result = parseToolCallsDetailed(parseSource.text, tools);
   if (result.tools.length === 1) {
     const tool = result.tools[0];
     log("tool-parse-hit", {
@@ -413,7 +522,10 @@ function parseToolsWithLog(text, tools, requestId, stream) {
       matchedFormat: result.matchedFormat,
       candidates: result.candidates,
       rejected: result.rejected,
-      modelTextPreview: preview(text, 1000),
+      textChars: typeof text === "string" ? text.length : 0,
+      parseChars: parseSource.text.length,
+      parseTruncated: parseSource.truncated,
+      modelTextPreview: preview(parseSource.text, 1000),
     });
     return result.tools;
   }
@@ -428,7 +540,10 @@ function parseToolsWithLog(text, tools, requestId, stream) {
       matchedFormat: result.matchedFormat,
       candidates: result.candidates,
       rejected: result.rejected,
-      modelTextPreview: preview(text, 1000),
+      textChars: typeof text === "string" ? text.length : 0,
+      parseChars: parseSource.text.length,
+      parseTruncated: parseSource.truncated,
+      modelTextPreview: preview(parseSource.text, 1000),
     });
     return result.tools;
   }
@@ -439,10 +554,52 @@ function parseToolsWithLog(text, tools, requestId, stream) {
       reason: result.reason,
       candidates: result.candidates,
       rejected: result.rejected,
-      modelTextPreview: preview(text, 1000),
+      textChars: typeof text === "string" ? text.length : 0,
+      parseChars: parseSource.text.length,
+      parseTruncated: parseSource.truncated,
+      modelTextPreview: preview(parseSource.text, 1000),
     });
   }
   return [];
+}
+
+function boundedToolParseText(text) {
+  const source = typeof text === "string" ? text : "";
+  if (source.length <= STREAM_PARSE_CHARS) {
+    return { text: source, truncated: false };
+  }
+
+  const structuralMarkers = [
+    "<tool_call",
+    "<tool-call",
+    "<tool-use",
+    "<tool_use",
+    "<invoke",
+    "<|tool",
+    "Tool:",
+    "Arguments:",
+    "mcp__autocode__",
+  ];
+  const fallbackMarkers = [
+    "Bash",
+    "Read",
+    "Write",
+    "Edit",
+    "Glob",
+    "Grep",
+  ];
+  let markerIndex = -1;
+  for (const marker of structuralMarkers) {
+    markerIndex = Math.max(markerIndex, source.lastIndexOf(marker));
+  }
+  if (markerIndex < 0) {
+    for (const marker of fallbackMarkers) {
+      markerIndex = Math.max(markerIndex, source.lastIndexOf(marker));
+    }
+  }
+  const tailStart = Math.max(0, source.length - STREAM_PARSE_CHARS);
+  const start = markerIndex >= tailStart ? markerIndex : tailStart;
+  return { text: source.slice(start, start + STREAM_PARSE_CHARS), truncated: true };
 }
 
 function looksLikeToolText(text) {
@@ -463,6 +620,22 @@ function safeJson(text) {
 function writeSse(res, event, data) {
   res.write(`event: ${event}\n`);
   res.write(`data: ${JSON.stringify(data)}\n\n`);
+}
+
+function readStreamChunk(reader) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => resolve({ timeout: true }), STREAM_READ_TIMEOUT_MS);
+    reader.read().then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
 }
 
 function streamAnthropicFromUpstream(res, upstreamRes, requestedModel, tools, requestId, startedAt) {
@@ -493,6 +666,7 @@ function streamAnthropicFromUpstream(res, upstreamRes, requestedModel, tools, re
   let stop = "end_turn";
   let usage = { input_tokens: 0, output_tokens: 0 };
   const nativeToolCalls = new Map();
+  let streamTimedOut = false;
 
   function handleData(dataText) {
     if (dataText === "[DONE]") {
@@ -548,8 +722,31 @@ function streamAnthropicFromUpstream(res, upstreamRes, requestedModel, tools, re
 
   (async () => {
     const reader = upstreamRes.body.getReader();
+    const streamStartedAt = Date.now();
     while (true) {
-      const { done, value } = await reader.read();
+      if (Date.now() - streamStartedAt > STREAM_TOTAL_TIMEOUT_MS) {
+        streamTimedOut = true;
+        log("stream-total-timeout", {
+          requestId,
+          timeoutMs: STREAM_TOTAL_TIMEOUT_MS,
+          textPreview: preview(text, 1000),
+          bufferPreview: preview(buffer, 1000),
+        });
+        await reader.cancel().catch(() => {});
+        break;
+      }
+      const { done, value, timeout } = await readStreamChunk(reader);
+      if (timeout) {
+        streamTimedOut = true;
+        log("stream-read-timeout", {
+          requestId,
+          timeoutMs: STREAM_READ_TIMEOUT_MS,
+          textPreview: preview(text, 1000),
+          bufferPreview: preview(buffer, 1000),
+        });
+        await reader.cancel().catch(() => {});
+        break;
+      }
       if (done) {
         break;
       }
@@ -567,7 +764,7 @@ function streamAnthropicFromUpstream(res, upstreamRes, requestedModel, tools, re
       }
     }
 
-    if (buffer.trim()) {
+    if (buffer.trim() && !streamTimedOut) {
       const dataLines = buffer
         .split(/\r?\n/)
         .filter((line) => line.startsWith("data:"))
@@ -575,6 +772,12 @@ function streamAnthropicFromUpstream(res, upstreamRes, requestedModel, tools, re
       for (const dataLine of dataLines) {
         handleData(dataLine);
       }
+    } else if (buffer.trim() && streamTimedOut) {
+      log("stream-leftover-discarded", {
+        requestId,
+        reason: "timeout",
+        bufferPreview: preview(buffer, 1000),
+      });
     }
     const nativeTools = [...nativeToolCalls.entries()]
       .sort((a, b) => a[0] - b[0])
@@ -657,7 +860,7 @@ function proxyMessages(req, res, body) {
   }
 
   const upstreamBody = buildUpstreamBody(body);
-  const deepseekThinking = resolveDeepseekThinking(body);
+  const upstreamThinking = resolveUpstreamThinking(body);
   log("request", {
     requestId,
     method: req.method,
@@ -666,7 +869,7 @@ function proxyMessages(req, res, body) {
     upstream: summarizeBody(upstreamBody),
     upstreamBytes: Buffer.byteLength(JSON.stringify(upstreamBody)),
     client_thinking: body?.thinking?.type,
-    deepseek_thinking: deepseekThinking,
+    upstream_thinking: upstreamThinking,
   });
 
   const payload = JSON.stringify(upstreamBody);
@@ -697,7 +900,7 @@ function proxyMessages(req, res, body) {
             bodyPreview: preview(text, 2000),
             durationMs: durationMs(startedAt),
           });
-          writeJson(res, upstreamRes.status, {
+          writeJson(res, failureStatus(), {
             error: {
               type: "api_error",
               message: text.slice(0, 1000) || `upstream returned ${upstreamRes.status}`,
@@ -721,8 +924,12 @@ function proxyMessages(req, res, body) {
           bodyPreview: preview(text, 2000),
           durationMs: durationMs(startedAt),
         });
-        res.writeHead(upstreamRes.status, { "content-type": "application/json; charset=utf-8" });
-        res.end(text);
+        writeJson(res, failureStatus(), {
+          error: {
+            type: "api_error",
+            message: text.slice(0, 1000) || `upstream returned ${upstreamRes.status}`,
+          },
+        });
         return;
       }
       const data = JSON.parse(text);
@@ -739,8 +946,21 @@ function proxyMessages(req, res, body) {
     })
     .catch((error) => {
       log("proxy-error", { requestId, durationMs: durationMs(startedAt), error });
-      writeJson(res, 502, { error: { type: "api_error", message: error.message } });
+      writeJson(res, failureStatus(), { error: { type: "api_error", message: error.message } });
     });
+}
+
+function proxyCountTokens(req, res, body) {
+  const requestId = makeRequestId("cc");
+  const inputTokens = countAnthropicInputTokens(body);
+  log("count-tokens", {
+    requestId,
+    method: req.method,
+    url: req.url,
+    input_tokens: inputTokens,
+    client: summarizeAnthropicBody(body),
+  });
+  writeJson(res, 200, { input_tokens: inputTokens });
 }
 
 const server = http.createServer(async (req, res) => {
@@ -748,6 +968,11 @@ const server = http.createServer(async (req, res) => {
     const pathName = new URL(req.url || "/", `http://${HOST}:${PORT}`).pathname;
     if (req.method === "GET" && pathName === "/health") {
       writeJson(res, 200, { ok: true, primary: DEFAULT_MODEL, models: [DEFAULT_MODEL] });
+      return;
+    }
+    if (req.method === "POST" && pathName === "/v1/messages/count_tokens") {
+      const body = await readJson(req);
+      proxyCountTokens(req, res, body);
       return;
     }
     if (req.method !== "POST" || pathName !== "/v1/messages") {
@@ -766,7 +991,17 @@ const server = http.createServer(async (req, res) => {
 function startServer() {
   server.listen(PORT, HOST, () => {
     fs.writeFileSync(PID_PATH, String(process.pid), "utf8");
-    log("listening", { host: HOST, port: PORT, model: DEFAULT_MODEL });
+    log("listening", {
+      host: HOST,
+      port: PORT,
+      model: DEFAULT_MODEL,
+      upstreamTimeoutMs: UPSTREAM_TIMEOUT_MS,
+      streamReadTimeoutMs: STREAM_READ_TIMEOUT_MS,
+      streamTotalTimeoutMs: STREAM_TOTAL_TIMEOUT_MS,
+      streamParseChars: STREAM_PARSE_CHARS,
+      upstreamRetryAttempts: UPSTREAM_RETRY_ATTEMPTS,
+      failureStatus: FAILURE_STATUS,
+    });
   });
 
   function cleanup() {
@@ -796,7 +1031,9 @@ module.exports = {
   anthropicMessagesToOpenAI,
   anthropicToolsToPrompt,
   buildUpstreamBody,
+  countAnthropicInputTokens,
   contentToText,
+  boundedToolParseText,
   resolveDeepseekThinking,
   selectRelevantTools,
   startServer,

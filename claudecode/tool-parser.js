@@ -34,7 +34,7 @@ function parseToolCallsDetailed(text, allowedTools) {
 
   const tools = normalizeAllowedTools(allowedTools);
   const normalized = normalizeText(text);
-  const searchable = removeCodeFences(normalized);
+  const searchable = /mcp__autocode__/i.test(normalized) ? normalized : removeCodeFences(normalized);
   const candidates = extractCandidates(searchable, tools);
   const rejected = [];
   const parsedResults = [];
@@ -48,7 +48,7 @@ function parseToolCallsDetailed(text, allowedTools) {
     for (const parsed of parsedList) {
       const finalized = finalizeTool(parsed, tools);
       if (finalized) {
-        parsedResults.push({ ...finalized, matchedFormat: candidate.format });
+        parsedResults.push({ ...finalized, matchedFormat: candidate.format, rawLength: String(candidate.raw || "").length });
         acceptedRaw.push(candidate.raw);
         continue;
       }
@@ -61,9 +61,10 @@ function parseToolCallsDetailed(text, allowedTools) {
   }
 
   if (parsedResults.length > 0) {
-    const first = parsedResults[0];
+    const selectedResults = selectBestParsedResults(parsedResults);
+    const first = selectedResults[0];
     return {
-      tools: parsedResults.map((result) => result.tool),
+      tools: selectedResults.map((result) => result.tool),
       candidates: candidates.length,
       rejected,
       matchedFormat: first.matchedFormat,
@@ -80,15 +81,49 @@ function parseToolCallsDetailed(text, allowedTools) {
   };
 }
 
+function selectBestParsedResults(parsedResults) {
+  if (parsedResults.length <= 1) {
+    return parsedResults;
+  }
+  const firstName = parsedResults[0].tool?.name;
+  if (!firstName || parsedResults.some((result) => result.tool?.name !== firstName)) {
+    return parsedResults;
+  }
+  if (!autocodeToolSuffix(firstName)) {
+    return parsedResults;
+  }
+  if (autocodeToolSuffix(firstName) !== "file_save") {
+    return [parsedResults[0]];
+  }
+  return [
+    parsedResults.reduce((best, current) =>
+      parsedResultScore(current) > parsedResultScore(best) ? current : best,
+    ),
+  ];
+}
+
+function parsedResultScore(result) {
+  const input = result.tool?.input && typeof result.tool.input === "object" ? result.tool.input : {};
+  const stringBytes = Object.values(input).reduce((sum, value) => {
+    if (typeof value === "string") {
+      return sum + value.length;
+    }
+    return sum;
+  }, 0);
+  return Object.keys(input).length * 100000 + stringBytes * 10 + (result.rawLength || 0);
+}
+
 function extractCandidates(text, tools) {
   return [
     ...extractDeepSeekTagCandidates(text),
+    ...extractCallingJsonCandidates(text, tools),
     ...extractToolUseCandidates(text),
     ...extractInvokeCandidates(text),
     ...extractUnnamedParameterCandidates(text),
     ...extractToolCallsInlineCandidates(text, tools),
     ...extractNamedXmlCandidates(text),
     ...extractToolXmlCandidates(text),
+    ...extractMalformedNestedArgCandidates(text, tools),
     ...extractArgKeyCandidates(text),
     ...extractToolCallBlockCandidates(text, tools),
     ...extractToolArgumentsCandidates(text),
@@ -97,6 +132,28 @@ function extractCandidates(text, tools) {
     ...extractFunctionCandidates(text, tools),
     ...extractPlainKeyValueCandidates(text, tools),
   ];
+}
+
+function extractCallingJsonCandidates(text, tools) {
+  const candidates = [];
+  const names = toolNamesPattern(tools);
+  const headerRe = new RegExp(`(?:^|\\n)\\s*(?:\\*{1,2})?(?:calling|call|调用)\\s*:?(?:\\*{1,2})?\\s*\`?(${names})\`?`, "gi");
+  let match;
+  while ((match = headerRe.exec(text)) !== null) {
+    const rest = text.slice(headerRe.lastIndex, headerRe.lastIndex + 12000);
+    const fenced = rest.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+    const inputText = fenced ? fenced[1] : extractFirstJsonObject(rest);
+    if (!inputText) {
+      continue;
+    }
+    candidates.push({
+      format: "calling-json",
+      name: canonicalToolName(match[1], tools),
+      inputText,
+      raw: text.slice(match.index, headerRe.lastIndex + rest.indexOf(inputText) + inputText.length),
+    });
+  }
+  return candidates;
 }
 
 function extractDeepSeekTagCandidates(text) {
@@ -308,6 +365,10 @@ function parseCandidate(candidate) {
     };
   }
   if (candidate.format === "unnamed-parameter-xml") {
+    const named = parseNameParameterXml(candidate.inputText);
+    if (named) {
+      return named;
+    }
     const input = parseParameterXml(candidate.inputText);
     return {
       name: inferToolNameFromInput(input),
@@ -317,7 +378,10 @@ function parseCandidate(candidate) {
   if (candidate.format === "named-xml" || candidate.format === "broken-tool-call") {
     return {
       name: candidate.name,
-      input: parseNamedXmlInput(candidate.inputText),
+      input:
+        candidate.name === "mcp__autocode__file_save"
+          ? parseFileSaveInput(candidate.inputText)
+          : parseNamedXmlInput(candidate.inputText),
     };
   }
   if (candidate.format === "arg-key-xml") {
@@ -380,25 +444,46 @@ function parseJsonToolCandidate(text) {
   const parsed = parseLooseJson(jsonText);
   if (Array.isArray(parsed)) {
     return parsed
-      .map((item) => {
-        if (!item || typeof item.name !== "string") {
-          return null;
-        }
-        return {
-          name: item.name,
-          input: item.input && typeof item.input === "object" ? item.input : {},
-        };
-      })
+      .map(parseJsonToolItem)
       .filter(Boolean);
   }
-  const item = Array.isArray(parsed) ? parsed[0] : parsed;
-  if (!item || typeof item.name !== "string") {
+  return parseJsonToolItem(parsed);
+}
+
+function parseJsonToolItem(item) {
+  if (!item || typeof item !== "object") {
     return null;
   }
-  return {
-    name: item.name,
-    input: item.input && typeof item.input === "object" ? item.input : {},
-  };
+  const functionCall = item.function && typeof item.function === "object" ? item.function : null;
+  const name =
+    typeof item.name === "string"
+      ? item.name
+      : typeof item.tool === "string"
+        ? item.tool
+        : typeof functionCall?.name === "string"
+          ? functionCall.name
+          : null;
+  if (!name) {
+    return null;
+  }
+  const rawInput =
+    item.input && typeof item.input === "object"
+      ? item.input
+      : item.arguments !== undefined
+        ? item.arguments
+        : item.args !== undefined
+          ? item.args
+          : functionCall?.arguments;
+  let input = {};
+  if (rawInput && typeof rawInput === "object") {
+    input = rawInput;
+  } else if (typeof rawInput === "string") {
+    const parsedInput = parseLooseJson(rawInput);
+    if (parsedInput && typeof parsedInput === "object") {
+      input = parsedInput;
+    }
+  }
+  return { name, input };
 }
 
 function parseInputText(text) {
@@ -414,9 +499,201 @@ function parseInputText(text) {
 
 function parseParameterXml(text) {
   const input = {};
-  const params = text.matchAll(/<parameter\b[^>]*\bname=["']?([^"'>\s]+)["']?[^>]*>\s*([\s\S]*?)\s*<\/parameter>/gi);
-  for (const param of params) {
-    input[param[1]] = decodeXmlEntities(param[2].trim());
+  const source = String(text || "");
+  const openRe = /<(parameter|param)\b/gi;
+  let match;
+  while ((match = openRe.exec(source)) !== null) {
+    const tagName = match[1].toLowerCase();
+    const tagEnd = findXmlTagEnd(source, openRe.lastIndex);
+    if (tagEnd < 0) {
+      break;
+    }
+
+    const rawAttrs = source.slice(openRe.lastIndex, tagEnd);
+    const selfClosing = /\/\s*$/.test(rawAttrs);
+    const attrs = selfClosing ? rawAttrs.replace(/\/\s*$/, "") : rawAttrs;
+    const name = xmlAttribute(attrs, "name");
+    const attrValue = xmlAttribute(attrs, "value") ?? xmlAttribute(attrs, "content");
+    if (!name) {
+      openRe.lastIndex = tagEnd + 1;
+      continue;
+    }
+
+    if (selfClosing) {
+      if (attrValue !== null) {
+        input[name] = decodeXmlEntities(attrValue.trim());
+      }
+      openRe.lastIndex = tagEnd + 1;
+      continue;
+    }
+
+    const closeRe = new RegExp(`</${tagName}\\s*>`, "ig");
+    closeRe.lastIndex = tagEnd + 1;
+    const close = closeRe.exec(source);
+    if (!close) {
+      if (attrValue !== null) {
+        input[name] = decodeXmlEntities(attrValue.trim());
+      }
+      openRe.lastIndex = tagEnd + 1;
+      continue;
+    }
+
+    const bodyValue = source.slice(tagEnd + 1, close.index).trim();
+    const chosen = chooseParameterValue(name, attrValue, bodyValue);
+    if (chosen !== null) {
+      input[name] = decodeXmlEntities(chosen.trim());
+    }
+    if (attrValue !== null && /<(?:parameter|param)\b/i.test(bodyValue)) {
+      openRe.lastIndex = tagEnd + 1;
+    } else {
+      openRe.lastIndex = close.index + close[0].length;
+    }
+  }
+  const broken = parseBrokenParameterXml(source);
+  for (const [key, value] of Object.entries(broken)) {
+    if (input[key] === undefined || shouldPreferBrokenParameterValue(key, input[key], value)) {
+      input[key] = value;
+    }
+  }
+  return input;
+}
+
+function shouldPreferBrokenParameterValue(key, current, repaired) {
+  if (typeof current !== "string" || typeof repaired !== "string") {
+    return false;
+  }
+  if (/<\/?(?:parameter|param|tool[-_]?call)\b/i.test(current)) {
+    return true;
+  }
+  if (/^(problem_dir|problem_name|solution_type|source_path|path|file_path)$/.test(key)) {
+    return !/[\r\n]/.test(repaired) && (/[\r\n]/.test(current) || current.length > repaired.length * 2);
+  }
+  return false;
+}
+
+function parseBrokenParameterXml(text) {
+  const input = {};
+  const source = String(text || "");
+  const openRe = /<(parameter|param)\b/gi;
+  let match;
+  while ((match = openRe.exec(source)) !== null) {
+    const tagStart = match.index;
+    const nextOpen = findNextParamOpen(source, openRe.lastIndex);
+    const close = source.indexOf(`</${match[1]}>`, openRe.lastIndex);
+    const segmentEnd = minPositive(nextOpen, close, source.length);
+    const segment = source.slice(tagStart, segmentEnd);
+    const name = xmlAttribute(segment, "name");
+    if (!name || input[name] !== undefined) {
+      continue;
+    }
+    const value = extractBrokenParamAttributeFromSegment(segment);
+    if (value !== null) {
+      input[name] = value;
+    }
+  }
+  return input;
+}
+
+function extractBrokenParamAttributeFromSegment(segment) {
+  const attrRe = /\b(?:value|content)\s*=\s*(["'])/i;
+  const attrMatch = attrRe.exec(segment);
+  if (!attrMatch) {
+    return null;
+  }
+  const valueStart = attrMatch.index + attrMatch[0].length;
+  const valueEnd = findBrokenParamValueEnd(segment, valueStart, attrMatch[1]);
+  if (valueEnd <= valueStart) {
+    return null;
+  }
+  return decodeXmlEntities(segment.slice(valueStart, valueEnd).trim());
+}
+
+function findXmlTagEnd(source, start) {
+  let quote = "";
+  for (let index = start; index < source.length; index++) {
+    const char = source[index];
+    if (quote) {
+      if (char === quote) {
+        quote = "";
+      }
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      quote = char;
+      continue;
+    }
+    if (char === ">") {
+      return index;
+    }
+  }
+  return -1;
+}
+
+function chooseParameterValue(name, attrValue, bodyValue) {
+  const attr = attrValue === null ? null : String(attrValue);
+  const body = String(bodyValue || "");
+  if (attr === null) {
+    return body;
+  }
+  if (!body.trim()) {
+    return attr;
+  }
+  if (/<(?:parameter|param)\b/i.test(body)) {
+    return attr;
+  }
+  if (name === "content") {
+    return body.length > attr.length ? body : attr;
+  }
+  return body || attr;
+}
+
+function xmlAttribute(attrs, name) {
+  const quoted = new RegExp(`\\b${escapeRegExp(name)}\\s*=\\s*(["'])([\\s\\S]*?)\\1`, "i").exec(attrs);
+  if (quoted) {
+    return quoted[2];
+  }
+  const bare = new RegExp(`\\b${escapeRegExp(name)}=([^\\s>]+)`, "i").exec(attrs);
+  return bare ? bare[1] : null;
+}
+
+function extractMalformedNestedArgCandidates(text, tools) {
+  const candidates = [];
+  const names = toolNamesPattern(tools);
+  const callRe = new RegExp(`<tool[-_]call>\\s*(${names})\\s*<tool[-_]call>([\\s\\S]*?)<\\/tool[-_]call>`, "gi");
+  for (const match of text.matchAll(callRe)) {
+    if (/<arg_key\b|<\/arg_key>\s*[\s\S]*?<arg_value\b/i.test(match[2])) {
+      candidates.push({ format: "arg-key-xml", name: canonicalToolName(match[1], tools), inputText: match[2], raw: match[0] });
+    }
+  }
+  return candidates;
+}
+
+function parseNameParameterXml(text) {
+  const name = String(text || "").match(/<name>\s*([A-Za-z0-9_-]+)\s*<\/name>/i)?.[1];
+  const parameterValues = parseNameParameterValuePairs(text);
+  if (name && Object.keys(parameterValues).length > 0) {
+    return {
+      name,
+      input: parameterValues,
+    };
+  }
+  const parameter = String(text || "").match(/<parameter(?:\s[^>]*)?>\s*([\s\S]*?)\s*<\/parameter>/i)?.[1];
+  if (!name || !parameter) {
+    return null;
+  }
+  const parsed = parseInputText(decodeXmlEntities(parameter.trim()));
+  return {
+    name,
+    input: parsed && typeof parsed === "object" ? parsed : {},
+  };
+}
+
+function parseNameParameterValuePairs(text) {
+  const input = {};
+  const source = String(text || "");
+  const pairRe = /<parameter>\s*([A-Za-z_][A-Za-z0-9_]*)\s*<\/parameter>\s*<value>\s*([\s\S]*?)\s*<\/value>/gi;
+  for (const pair of source.matchAll(pairRe)) {
+    input[pair[1]] = decodeXmlEntities(pair[2].trim());
   }
   return input;
 }
@@ -435,7 +712,7 @@ function parseNamedXmlInput(text) {
   if (!source) {
     return {};
   }
-  if (/<parameter\s+name=/i.test(source)) {
+  if (/<(?:parameter|param)\s+name=/i.test(source)) {
     return parseParameterXml(source);
   }
   if (source.includes("{")) {
@@ -445,23 +722,245 @@ function parseNamedXmlInput(text) {
     }
   }
   const childInput = parseChildElementXml(source);
+  if (Object.keys(childInput).length === 1 && typeof childInput.input === "string" && /<\s*[A-Za-z_][A-Za-z0-9_-]*\b/i.test(childInput.input)) {
+    const unwrapped = parseNamedXmlInput(childInput.input);
+    if (Object.keys(unwrapped).length > 0) {
+      return unwrapped;
+    }
+  }
   if (Object.keys(childInput).length > 0) {
     return childInput;
   }
   return parseInputText(source);
 }
 
+function parseFileSaveInput(text) {
+  const parsed = parseNamedXmlInput(text);
+  const attrRepaired = parseSelfClosingFileSaveInput(text, parsed);
+  const brokenAttrRepaired = parseBrokenFileSaveParameterInput(text);
+  const repaired = parseJsonishFileSaveInput(text);
+  let best = parsed;
+  for (const candidate of [attrRepaired, brokenAttrRepaired, repaired]) {
+    if (!candidate) {
+      continue;
+    }
+    const bestContentLength = typeof best.content === "string" ? best.content.length : 0;
+    const candidateContentLength = typeof candidate.content === "string" ? candidate.content.length : 0;
+    if (candidateContentLength > bestContentLength) {
+      best = {
+        ...candidate,
+        problem_dir: usableFileSaveField(parsed.problem_dir) ? parsed.problem_dir : candidate.problem_dir,
+        path: usableFileSaveField(parsed.path) ? parsed.path : candidate.path,
+        content: candidate.content,
+      };
+    }
+  }
+  return best;
+}
+
+function usableFileSaveField(value) {
+  return typeof value === "string" && value.trim() && !/[\r\n]/.test(value) && !/<\/?(?:parameter|param|tool[-_]?call)\b/i.test(value);
+}
+
+function parseSelfClosingFileSaveInput(text, parsed = {}) {
+  const content = extractGreedySelfClosingParamAttribute(text, "content");
+  if (content === null) {
+    return null;
+  }
+  const problemDir = usableFileSaveField(parsed.problem_dir) ? parsed.problem_dir : extractGreedySelfClosingParamAttribute(text, "problem_dir");
+  const path = usableFileSaveField(parsed.path) ? parsed.path : extractGreedySelfClosingParamAttribute(text, "path");
+  if (!problemDir || !path) {
+    return null;
+  }
+  return { problem_dir: problemDir, path, content };
+}
+
+function extractGreedySelfClosingParamAttribute(text, paramName) {
+  const source = String(text || "");
+  const nameRe = new RegExp(`\\bname\\s*=\\s*["']${escapeRegExp(paramName)}["']`, "gi");
+  let nameMatch;
+  while ((nameMatch = nameRe.exec(source)) !== null) {
+    const tagStart = Math.max(
+      source.lastIndexOf("<parameter", nameMatch.index),
+      source.lastIndexOf("<param", nameMatch.index),
+    );
+    const previousClose = source.lastIndexOf("/>", nameMatch.index);
+    if (tagStart < 0 || previousClose > tagStart) {
+      continue;
+    }
+    const attrRe = /\b(?:value|content)\s*=\s*(["'])/gi;
+    attrRe.lastIndex = tagStart;
+    const attrMatch = attrRe.exec(source);
+    if (!attrMatch) {
+      continue;
+    }
+    const quote = attrMatch[1];
+    const start = attrRe.lastIndex;
+    const closeRe = new RegExp(`${escapeRegExp(quote)}\\s*\\/\\s*>`, "g");
+    closeRe.lastIndex = start;
+    const close = closeRe.exec(source);
+    if (!close) {
+      continue;
+    }
+    return decodeXmlEntities(source.slice(start, close.index).trim());
+  }
+  return null;
+}
+
+function parseBrokenFileSaveParameterInput(text) {
+  const problemDir = extractBrokenParamAttribute(text, "problem_dir");
+  const path = extractBrokenParamAttribute(text, "path");
+  const content = extractBrokenParamAttribute(text, "content");
+  if (!problemDir || !path || content === null) {
+    return null;
+  }
+  return { problem_dir: problemDir, path, content };
+}
+
+function extractBrokenParamAttribute(text, paramName) {
+  const source = String(text || "");
+  const openRe = /<(parameter|param)\b/gi;
+  let match;
+  while ((match = openRe.exec(source)) !== null) {
+    const tagStart = match.index;
+    const nextOpen = findNextParamOpen(source, openRe.lastIndex);
+    const toolClose = source.indexOf("</tool_call>", openRe.lastIndex);
+    const segmentEnd = minPositive(nextOpen, toolClose, source.length);
+    const segment = source.slice(tagStart, segmentEnd);
+    const name = xmlAttribute(segment, "name");
+    if (name !== paramName) {
+      continue;
+    }
+
+    const attrRe = /\b(?:value|content)\s*=\s*(["'])/i;
+    const attrMatch = attrRe.exec(segment);
+    if (!attrMatch) {
+      continue;
+    }
+    const valueStart = attrMatch.index + attrMatch[0].length;
+    if (hasNormalOpeningTagEnd(segment, valueStart, attrMatch[1])) {
+      continue;
+    }
+    const valueEnd = findBrokenParamValueEnd(segment, valueStart, attrMatch[1]);
+    if (valueEnd <= valueStart) {
+      continue;
+    }
+    return decodeXmlEntities(segment.slice(valueStart, valueEnd).trim());
+  }
+  return null;
+}
+
+function hasNormalOpeningTagEnd(segment, start, quote) {
+  const normalEndRe = new RegExp(`${escapeRegExp(quote)}\\s*>`, "g");
+  normalEndRe.lastIndex = start;
+  const normalEnd = normalEndRe.exec(segment);
+  if (!normalEnd) {
+    return false;
+  }
+  const closeTag = segment.slice(start).search(/<\/(?:parameter|param)\s*>/i);
+  return closeTag < 0 || normalEnd.index < start + closeTag;
+}
+
+function findNextParamOpen(source, start) {
+  const rest = source.slice(start);
+  const match = /<(?:parameter|param)\b/i.exec(rest);
+  return match ? start + match.index : -1;
+}
+
+function findBrokenParamValueEnd(segment, start, quote) {
+  const closeTag = segment.slice(start).search(/<\/(?:parameter|param)\s*>/i);
+  if (closeTag >= 0) {
+    return start + closeTag;
+  }
+  const selfClosingRe = new RegExp(`${escapeRegExp(quote)}\\s*\\/\\s*>`, "g");
+  selfClosingRe.lastIndex = start;
+  const selfClosing = selfClosingRe.exec(segment);
+  if (selfClosing) {
+    return selfClosing.index;
+  }
+  return segment.length;
+}
+
+function minPositive(...values) {
+  return values.filter((value) => typeof value === "number" && value >= 0).reduce((best, value) => Math.min(best, value), Infinity);
+}
+
+function parseJsonishFileSaveInput(text) {
+  const source = String(text || "");
+  const problemDir = extractJsonishStringField(source, "problem_dir");
+  const path = extractJsonishStringField(source, "path");
+  const content = extractJsonishStringField(source, "content");
+  if (!problemDir || !path || content === null) {
+    return null;
+  }
+  return { problem_dir: problemDir, path, content };
+}
+
+function extractJsonishStringField(text, key) {
+  const keyRe = new RegExp(`["']${escapeRegExp(key)}["']\\s*:\\s*["']`, "i");
+  const match = keyRe.exec(text);
+  if (!match) {
+    return null;
+  }
+  const start = match.index + match[0].length;
+  let escaped = false;
+  for (let index = start; index < text.length; index++) {
+    const char = text[index];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (char === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (char !== '"' && char !== "'") {
+      continue;
+    }
+    const rest = text.slice(index + 1);
+    if (/^\s*(?:,\s*["'][A-Za-z_][A-Za-z0-9_]*["']\s*:|[})])/.test(rest)) {
+      return decodeJsonishString(text.slice(start, index));
+    }
+  }
+  return decodeJsonishString(text.slice(start));
+}
+
+function decodeJsonishString(value) {
+  return String(value || "")
+    .replace(/\\r/g, "\r")
+    .replace(/\\n/g, "\n")
+    .replace(/\\"/g, '"')
+    .replace(/\\'/g, "'");
+}
+
 function parseArgKeyXml(text) {
   const input = {};
-  const pairs = text.matchAll(/<arg_key>\s*([\s\S]*?)\s*<\/arg_key>\s*<arg_value>\s*([\s\S]*?)\s*<\/arg_value>/gi);
+  const source = repairArgKeyXml(text);
+  const pairs = source.matchAll(/(?:<arg_key>|<tool[-_]call>|^)\s*([\s\S]*?)\s*<\/arg_key>\s*<arg_value>\s*([\s\S]*?)\s*<\/arg_value>/gi);
   for (const pair of pairs) {
     input[pair[1].trim()] = pair[2].trim();
   }
-  const malformedPairs = text.matchAll(/<arg_key>\s*([A-Za-z_][A-Za-z0-9_]*["']?\s*[:=]\s*(?:"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|[^<\n]+))\s*<\/arg_value>/gi);
+  const barePairs = source.matchAll(
+    /(?:<arg_key>|<tool[-_]call>|^)\s*([A-Za-z_][A-Za-z0-9_]*)\s*(?:<\/arg_key>)?\s*<arg_value>\s*([\s\S]*?)(?=<\/arg_value>\s*<arg_key>|<arg_key>|<tool[-_]call>\s*[A-Za-z_][A-Za-z0-9_]*\s*(?:<\/arg_key>)?\s*<arg_value>|<\/tool[-_]call>|$)/gi,
+  );
+  for (const pair of barePairs) {
+    if (input[pair[1]] === undefined) {
+      input[pair[1]] = pair[2].replace(/<\/arg_value>\s*$/i, "").trim();
+    }
+  }
+  const malformedPairs = source.matchAll(/<arg_key>\s*([A-Za-z_][A-Za-z0-9_]*["']?\s*[:=]\s*(?:"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|[^<\n]+))\s*<\/arg_value>/gi);
   for (const pair of malformedPairs) {
     Object.assign(input, parseKeyValues(pair[1].replace(/^([A-Za-z_][A-Za-z0-9_]*)["']\s*:/, "$1:")));
   }
   return input;
+}
+
+function repairArgKeyXml(text) {
+  return String(text || "")
+    .replace(/<arg_value>([^<]*?)<tool[-_]call>\s*([A-Za-z_][A-Za-z0-9_]*)\s*<\/arg_key>/gi, "<arg_value>$1</arg_value><arg_key>$2</arg_key>")
+    .replace(/<tool[-_]call>\s*([A-Za-z_][A-Za-z0-9_]*)\s*<\/arg_key>/gi, "<arg_key>$1</arg_key>")
+    .replace(/<\/arg_value>\s*([A-Za-z_][A-Za-z0-9_]*)\s*<\/arg_key>/gi, "</arg_value><arg_key>$1</arg_key>")
+    .replace(/<tool[-_]call>\s*([A-Za-z_][A-Za-z0-9_]*)\s*<arg_value>/gi, "<arg_key>$1</arg_key><arg_value>");
 }
 
 function inferToolNameFromInput(input) {
@@ -509,18 +1008,29 @@ function finalizeTool(parsed, tools) {
     return null;
   }
 
+  const input = parsed.input && typeof parsed.input === "object" ? { ...parsed.input } : {};
   let name = canonicalToolName(parsed.name, tools);
   let allowed = tools?.get(name.toLowerCase());
   if (tools && !allowed) {
     if (name === "Write" && tools.has("edit")) {
       name = canonicalToolName("Edit", tools);
       allowed = tools.get(name.toLowerCase());
+    } else if (name === "Read") {
+      const fileReadTool = findAllowedAutocodeTool(tools, "file_read");
+      if (!fileReadTool) {
+        return null;
+      }
+      name = fileReadTool.name;
+      allowed = fileReadTool;
+      if (input.path === undefined && input.file_path !== undefined) {
+        input.path = input.file_path;
+      }
+      delete input.file_path;
     } else {
       return null;
     }
   }
 
-  const input = parsed.input && typeof parsed.input === "object" ? { ...parsed.input } : {};
   if (name === "Edit" && input.content !== undefined && input.new_string === undefined) {
     input.new_string = input.content;
     if (input.old_string === undefined) {
@@ -530,7 +1040,7 @@ function finalizeTool(parsed, tools) {
   }
   for (const [key, value] of Object.entries(input)) {
     if (typeof value === "string") {
-      input[key] = normalizeInputValue(value);
+      input[key] = normalizeInputValue(value, allowed?.propertyTypes?.[key], key);
     }
   }
   const rawInputKeys = Object.keys(input);
@@ -584,6 +1094,18 @@ function finalizeTool(parsed, tools) {
   };
 }
 
+function findAllowedAutocodeTool(tools, suffix) {
+  if (!tools) {
+    return null;
+  }
+  for (const tool of tools.values()) {
+    if (autocodeToolSuffix(tool.name) === suffix) {
+      return tool;
+    }
+  }
+  return null;
+}
+
 function parseToolCallsText(text, allowedTools) {
   return parseToolCallsDetailed(text, allowedTools).tools;
 }
@@ -623,6 +1145,7 @@ function normalizeAllowedTools(allowedTools) {
       name: tool.name,
       required: schemaRequired(tool.input_schema) || COMMON_REQUIRED[tool.name] || [],
       properties: schemaProperties(tool.input_schema),
+      propertyTypes: schemaPropertyTypes(tool.input_schema),
     });
   }
   return map.size > 0 ? map : null;
@@ -637,6 +1160,19 @@ function schemaProperties(schema) {
     return null;
   }
   return Object.keys(schema.properties).filter((key) => typeof key === "string");
+}
+
+function schemaPropertyTypes(schema) {
+  if (!schema?.properties || typeof schema.properties !== "object") {
+    return null;
+  }
+  const types = {};
+  for (const [key, value] of Object.entries(schema.properties)) {
+    if (value && typeof value === "object" && typeof value.type === "string") {
+      types[key] = value.type;
+    }
+  }
+  return types;
 }
 
 function normalizeText(text) {
@@ -696,21 +1232,86 @@ function hasUnbalancedQuotes(value) {
   return inSingle || inDouble;
 }
 
-function normalizeInputValue(value) {
+function normalizeInputValue(value, expectedType, key = "") {
   if (typeof value !== "string") {
     return value;
   }
-  return unquote(value);
+  const normalized = unquote(value);
+  if (expectedType === "object" || expectedType === "array") {
+    const parsed = parseLooseJson(normalized);
+    if (expectedType === "object" && parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed;
+    }
+    if (expectedType === "array" && Array.isArray(parsed)) {
+      return parsed;
+    }
+  }
+  if (expectedType === "boolean") {
+    const boolText = normalized.replace(/<\/arg_value>\s*$/i, "").replace(/[)\]}]+$/g, "").trim().toLowerCase();
+    if (boolText === "true") {
+      return true;
+    }
+    if (boolText === "false") {
+      return false;
+    }
+  }
+  if (expectedType === "number" || expectedType === "integer") {
+    const numberText = normalized.replace(/<\/arg_value>\s*$/i, "").replace(/[)\]}]+$/g, "").trim();
+    if (/^-?\d+(?:\.\d+)?$/.test(numberText)) {
+      const n = Number(numberText);
+      if (Number.isFinite(n)) {
+        return expectedType === "integer" ? Math.trunc(n) : n;
+      }
+    }
+  }
+  if (/^(problem_dir|problem_name|solution_type|source_path|path|file_path)$/.test(key)) {
+    return normalized.replace(/<\/arg_value>\s*$/i, "").replace(/["']?\)+$/g, "").trim();
+  }
+  return normalized;
 }
 
 function canonicalToolName(name, tools) {
   const raw = String(name || "");
-  return tools?.get(raw.toLowerCase())?.name || raw;
+  const lower = raw.toLowerCase();
+  const direct = tools?.get(lower)?.name;
+  if (direct) {
+    return direct;
+  }
+  const suffix = autocodeToolSuffix(lower);
+  if (suffix && tools) {
+    for (const tool of tools.values()) {
+      if (autocodeToolSuffix(tool.name) === suffix) {
+        return tool.name;
+      }
+    }
+  }
+  return raw;
 }
 
 function toolNamesPattern(tools) {
-  const names = tools ? [...tools.values()].map((tool) => tool.name) : Object.keys(COMMON_REQUIRED);
+  const names = tools ? [...tools.values()].flatMap(toolNameAliases) : Object.keys(COMMON_REQUIRED);
   return names.map(escapeRegExp).join("|");
+}
+
+function toolNameAliases(tool) {
+  const names = [tool.name];
+  const suffix = autocodeToolSuffix(tool.name);
+  if (suffix) {
+    names.push(`mcp__autocode__${suffix}`);
+    names.push(`mcp__plugin_autocode_autocode__${suffix}`);
+  }
+  return [...new Set(names)];
+}
+
+function autocodeToolSuffix(name) {
+  const lower = String(name || "").toLowerCase();
+  if (lower.startsWith("mcp__autocode__")) {
+    return lower.slice("mcp__autocode__".length);
+  }
+  if (lower.startsWith("mcp__plugin_autocode_autocode__")) {
+    return lower.slice("mcp__plugin_autocode_autocode__".length);
+  }
+  return "";
 }
 
 function escapeRegExp(text) {
