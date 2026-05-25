@@ -1,5 +1,7 @@
 #!/usr/bin/env node
+const { spawnSync } = require("child_process");
 const http = require("http");
+const path = require("path");
 const { getApiKey, envNumber, loadDotEnv } = require("../shared/env");
 
 loadDotEnv();
@@ -10,8 +12,16 @@ const CODEBUDDY_CHAT_URL = `http://127.0.0.1:${envNumber("CODEBUDDY_PROXY_PORT",
 const CODEBUDDY_RESPONSES_URL = `http://127.0.0.1:${envNumber("CODEBUDDY_PROXY_PORT", envNumber("PORT", 8787))}/v1/responses`;
 const CLAUDE_URL = `http://127.0.0.1:${envNumber("CLAUDE_SZTU_PROXY_PORT", 8790)}/v1/messages`;
 const CLAUDE_HEALTH_URL = `http://127.0.0.1:${envNumber("CLAUDE_SZTU_PROXY_PORT", 8790)}/health`;
+const EXPECTED_CLAUDE_PRIMARY_MODEL = process.env.SZTU_DEFAULT_MODEL || "glm-5.1";
+const EXPECTED_CLAUDE_FALLBACK_MODEL = String(process.env.CLAUDE_SZTU_FALLBACK_MODEL || "deepseek-v4-pro").trim();
 
 const DEFAULT_TIMEOUT_MS = envNumber("TEST_TIMEOUT_MS", 120000);
+
+function expectedClaudeFallbackModel() {
+  return EXPECTED_CLAUDE_FALLBACK_MODEL && EXPECTED_CLAUDE_FALLBACK_MODEL !== EXPECTED_CLAUDE_PRIMARY_MODEL
+    ? EXPECTED_CLAUDE_FALLBACK_MODEL
+    : "";
+}
 
 function usage() {
   console.log(`Usage: node scripts/test-api.js [suite...]
@@ -21,6 +31,7 @@ Suites:
   opencode        Test opencode proxy on ${OPENCODE_URL}
   codebuddy       Test codebuddy proxy on ${CODEBUDDY_CHAT_URL}
   claudecode      Test Claude Code Anthropic proxy on ${CLAUDE_URL}
+  fallback        Test Claude Code GLM-to-DeepSeek fallback with local mocks
   all             Run every suite
 
 Examples:
@@ -38,7 +49,7 @@ function parseSuites() {
   }
   const suites = args.length === 0 ? ["direct"] : args;
   if (suites.includes("all")) {
-    return ["direct", "opencode", "codebuddy", "claudecode"];
+    return ["direct", "opencode", "codebuddy", "claudecode", "fallback"];
   }
   return suites;
 }
@@ -392,22 +403,47 @@ async function testClaudeCode() {
   ok.push(await testCase("claudecode proxy health", async () => {
     const res = await fetchText(CLAUDE_HEALTH_URL);
     assertOk(res.status === 200, `status=${res.status} body=${res.text.slice(0, 200)}`);
+    const health = parseJson(res.text);
+    const expectedFallback = expectedClaudeFallbackModel();
+    assertOk(health?.primary === EXPECTED_CLAUDE_PRIMARY_MODEL, `expected primary ${EXPECTED_CLAUDE_PRIMARY_MODEL}, got ${res.text.slice(0, 200)}`);
+    assertOk(Array.isArray(health?.models) && health.models.includes(EXPECTED_CLAUDE_PRIMARY_MODEL), `missing primary model=${res.text.slice(0, 200)}`);
+    if (expectedFallback) {
+      assertOk(health?.fallback === expectedFallback, `expected fallback ${expectedFallback}, got ${res.text.slice(0, 200)}`);
+      assertOk(health.models.includes(expectedFallback), `missing fallback model=${res.text.slice(0, 200)}`);
+    } else {
+      assertOk(health?.fallback === null, `expected no fallback, got ${res.text.slice(0, 200)}`);
+    }
     return res.text;
   }));
-  ok.push(await anthropicNonStream("claudecode sonnet alias non-stream", "claude-sonnet-4-5", "SONNET_ALIAS_OK"));
-  ok.push(await anthropicStream("claudecode sonnet alias stream usage", "claude-sonnet-4-5", "SONNET_ALIAS_STREAM_OK"));
-  ok.push(await anthropicNonStream("claudecode haiku alias non-stream", "claude-3-5-haiku-latest", "HAIKU_ALIAS_OK"));
-  ok.push(await anthropicStream("claudecode haiku alias stream usage", "claude-3-5-haiku-latest", "HAIKU_ALIAS_STREAM_OK"));
-  ok.push(await anthropicToolBridge("claudecode sonnet alias tool bridge", "claude-sonnet-4-5"));
-  ok.push(await anthropicToolBridge("claudecode haiku alias tool bridge", "claude-3-5-haiku-latest"));
-  ok.push(await anthropicToolBridgeStream("claudecode haiku alias tool bridge stream", "claude-3-5-haiku-latest"));
-  ok.push(await anthropicToolResultLoop("claudecode haiku alias tool result loop", "claude-3-5-haiku-latest"));
+  ok.push(await anthropicNonStream("claudecode glm-first sonnet alias non-stream", "claude-sonnet-4-5", "SONNET_ALIAS_OK"));
+  ok.push(await anthropicStream("claudecode glm-first sonnet alias stream usage", "claude-sonnet-4-5", "SONNET_ALIAS_STREAM_OK"));
+  ok.push(await anthropicNonStream("claudecode glm-first haiku alias non-stream", "claude-3-5-haiku-latest", "HAIKU_ALIAS_OK"));
+  ok.push(await anthropicStream("claudecode glm-first haiku alias stream usage", "claude-3-5-haiku-latest", "HAIKU_ALIAS_STREAM_OK"));
+  ok.push(await anthropicToolBridge("claudecode glm-first sonnet alias tool bridge", "claude-sonnet-4-5"));
+  ok.push(await anthropicToolBridge("claudecode glm-first haiku alias tool bridge", "claude-3-5-haiku-latest"));
+  ok.push(await anthropicToolBridgeStream("claudecode glm-first haiku alias tool bridge stream", "claude-3-5-haiku-latest"));
+  ok.push(await anthropicToolResultLoop("claudecode glm-first haiku alias tool result loop", "claude-3-5-haiku-latest"));
+  return ok;
+}
+
+async function testClaudeCodeFallback() {
+  const ok = [];
+  ok.push(await testCase("claudecode GLM fallback mock suite", async () => {
+    const result = spawnSync(process.execPath, [path.join(__dirname, "test-claudecode-fallback.js")], {
+      cwd: path.resolve(__dirname, ".."),
+      encoding: "utf8",
+      env: process.env,
+    });
+    const output = `${result.stdout || ""}${result.stderr || ""}`.trim();
+    assertOk(result.status === 0, output.slice(-1000) || `exit status ${result.status}`);
+    return output.split(/\r?\n/).filter(Boolean).pop();
+  }));
   return ok;
 }
 
 async function main() {
   const suites = parseSuites();
-  const valid = new Set(["direct", "opencode", "codebuddy", "claudecode"]);
+  const valid = new Set(["direct", "opencode", "codebuddy", "claudecode", "fallback"]);
   for (const suite of suites) {
     if (!valid.has(suite)) {
       throw new Error(`unknown suite: ${suite}`);
@@ -425,6 +461,8 @@ async function main() {
       results.push(...await testCodeBuddy());
     } else if (suite === "claudecode") {
       results.push(...await testClaudeCode());
+    } else if (suite === "fallback") {
+      results.push(...await testClaudeCodeFallback());
     }
   }
 

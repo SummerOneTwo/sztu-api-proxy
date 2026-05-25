@@ -7,11 +7,28 @@ const {
   boundedToolParseText,
   buildUpstreamBody,
   buildUpstreamRequest,
+  fallbackModelFor,
+  hasToolExecutionHistory,
+  hasUnsafeToolExecutionHistory,
+  isRetryableFallbackStatus,
+  isReadOnlyToolName,
   selectRelevantTools,
+  shouldFallbackToModel,
   toAnthropicMessage,
   upstreamToolName,
   userIntentText,
 } = require("../claudecode/claudecode-proxy");
+
+const EXPECTED_PRIMARY_MODEL = process.env.SZTU_DEFAULT_MODEL || "glm-5.1";
+const EXPECTED_FALLBACK_MODEL = String(process.env.CLAUDE_SZTU_FALLBACK_MODEL || "deepseek-v4-pro").trim();
+
+function expectedFallbackFor(model) {
+  return EXPECTED_FALLBACK_MODEL && EXPECTED_FALLBACK_MODEL !== model ? EXPECTED_FALLBACK_MODEL : "";
+}
+
+function expectedChatTemplateKwargs(model, thinking) {
+  return model === "deepseek-v4-pro" ? { thinking } : { enable_thinking: thinking };
+}
 
 const tools = ["Bash", "Read", "Write", "Edit", "Glob", "Grep"].map((name) => ({
   name,
@@ -161,17 +178,32 @@ const upstreamThinkingBody = buildUpstreamBody({
   messages: [{ role: "user", content: "请只回复 OK" }],
   max_tokens: 128,
 });
-assert.strictEqual(upstreamThinkingBody.model, "deepseek-v4-pro", "Claude Code proxy should default to the currently healthy DeepSeek upstream");
+assert.strictEqual(upstreamThinkingBody.model, EXPECTED_PRIMARY_MODEL, "Claude Code proxy should use the configured default engineering model");
 assert.deepStrictEqual(
   upstreamThinkingBody.chat_template_kwargs,
-  { thinking: true },
-  "DeepSeek upstream should receive thinking in chat_template_kwargs",
+  expectedChatTemplateKwargs(EXPECTED_PRIMARY_MODEL, true),
+  "upstream should receive the configured model's thinking template kwargs",
 );
 assert.strictEqual(
   upstreamThinkingBody.max_tokens,
   10000,
   "thinking requests should get enough upstream token budget for reasoning plus answer text",
 );
+assert.strictEqual(fallbackModelFor(upstreamThinkingBody), expectedFallbackFor(EXPECTED_PRIMARY_MODEL), "Claude Code fallback model should follow configuration");
+assert.strictEqual(shouldFallbackToModel({ messages: [{ role: "user", content: "hello" }] }, upstreamThinkingBody), Boolean(expectedFallbackFor(EXPECTED_PRIMARY_MODEL)), "fresh user requests may fall back when a distinct fallback is configured");
+assert.strictEqual(shouldFallbackToModel({ messages }, upstreamThinkingBody), false, "unsafe prior tool execution should not switch fallback models");
+assert.strictEqual(hasToolExecutionHistory({ messages }), true, "tool_use/tool_result history should count as tool execution history");
+assert.strictEqual(hasUnsafeToolExecutionHistory({ messages }), true, "Bash tool history should block mid-loop fallback");
+const readOnlyMessages = [
+  { role: "user", content: "read README" },
+  { role: "assistant", content: [{ type: "tool_use", id: "toolu_read", name: "mcp__plugin_autocode_autocode__file_read", input: { path: "README.md" } }] },
+  { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_read", content: "README content" }] },
+];
+assert.strictEqual(isReadOnlyToolName("mcp__plugin_autocode_autocode__file_read"), true, "MCP file_read should count as read-only fallback-safe history");
+assert.strictEqual(hasUnsafeToolExecutionHistory({ messages: readOnlyMessages }), false, "read-only tool history should allow safe fallback");
+assert.strictEqual(shouldFallbackToModel({ messages: readOnlyMessages }, upstreamThinkingBody), Boolean(expectedFallbackFor(EXPECTED_PRIMARY_MODEL)), "read-only tool history may fall back when a distinct fallback is configured");
+assert.strictEqual(isRetryableFallbackStatus(502), true, "5xx upstream statuses should be fallback-eligible");
+assert.strictEqual(isRetryableFallbackStatus(400), false, "schema/client errors should not be fallback-eligible");
 
 const upstreamLargeThinkingBody = buildUpstreamBody({
   model: "claude-3-5-haiku-latest",
@@ -187,6 +219,14 @@ const upstreamNoThinkingBody = buildUpstreamBody({
   thinking: { type: "disabled" },
 });
 assert.strictEqual(upstreamNoThinkingBody.max_tokens, 128, "disabled thinking should preserve the requested token budget");
+assert.deepStrictEqual(upstreamNoThinkingBody.chat_template_kwargs, expectedChatTemplateKwargs(EXPECTED_PRIMARY_MODEL, false), "disabled thinking should map to the configured model template kwargs");
+const fallbackThinkingBody = buildUpstreamBody({
+  model: "claude-3-5-haiku-latest",
+  messages: [{ role: "user", content: "请只回复 OK" }],
+  max_tokens: 128,
+}, { upstreamModel: "deepseek-v4-pro" });
+assert.strictEqual(fallbackThinkingBody.model, "deepseek-v4-pro", "fallback request should target DeepSeek when requested");
+assert.deepStrictEqual(fallbackThinkingBody.chat_template_kwargs, { thinking: true }, "DeepSeek fallback should receive thinking in chat_template_kwargs");
 const upstreamMessages = anthropicMessagesToOpenAI({ tools, messages }, { toolMode: "native" });
 assert(
   !upstreamMessages.some((message) => Array.isArray(message.tool_calls)),
@@ -211,8 +251,12 @@ const promptUpstreamMessages = anthropicMessagesToOpenAI({ tools, messages }, { 
 const toolResultMessage = promptUpstreamMessages.find((message) => String(message.content || "").includes("Tool result:\ntotal 0"));
 assert(toolResultMessage, "prompt mode should keep tool_result as user text");
 assert(
-  toolResultMessage.content.includes("request exactly one tool call"),
+  toolResultMessage.content.includes("request exactly one new tool call"),
   "prompt-mode tool result should allow follow-up tool calls",
+);
+assert(
+  toolResultMessage.content.includes("Do not repeat the same tool call"),
+  "tool result prompt should discourage repeated GLM tool calls",
 );
 assert(
   !toolResultMessage.content.includes("Answer the user's original request directly"),

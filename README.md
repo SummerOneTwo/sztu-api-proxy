@@ -17,7 +17,8 @@ SZTU_API_KEY=your_key_here
 Optional:
 
 ```env
-SZTU_DEFAULT_MODEL=deepseek-v4-pro
+SZTU_DEFAULT_MODEL=glm-5.1
+CLAUDE_SZTU_FALLBACK_MODEL=deepseek-v4-pro
 OPENCODE_PROXY_PORT=8788
 CLAUDE_SZTU_PROXY_PORT=8790
 CODEBUDDY_PROXY_PORT=8787
@@ -28,7 +29,12 @@ CLAUDE_SZTU_TOOL_MODE=native
 CLAUDE_SZTU_TOOL_HISTORY_MODE=text
 ```
 
-Claude Code proxy (`claudecode/`) is currently optimized for DeepSeek; see
+Existing installs should update `.env` as well as client settings. The proxy uses
+the process environment first, then `.env`; Claude Code `settings.json` model
+names do not override `SZTU_DEFAULT_MODEL`.
+
+Claude Code proxy (`claudecode/`) is currently optimized for GLM-first use with
+DeepSeek fallback; see
 `claudecode/README.md`.
 
 ## Proxies

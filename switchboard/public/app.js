@@ -106,16 +106,16 @@ const configs = [
     name: "Claude Code",
     target: "settings.json / env",
     url: "http://127.0.0.1:8790",
-    models: ["deepseek-v4-pro"],
-    notes: "Anthropic-compatible base URL",
+    models: ["glm-5.1", "deepseek-v4-pro"],
+    notes: "Anthropic-compatible base URL; .env SZTU_DEFAULT_MODEL controls primary, CLAUDE_SZTU_FALLBACK_MODEL controls fallback",
     snippet: `{
   "env": {
     "ANTHROPIC_BASE_URL": "http://127.0.0.1:8790",
     "ANTHROPIC_API_KEY": "any",
-    "ANTHROPIC_MODEL": "deepseek-v4-pro",
-    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "deepseek-v4-pro",
-    "ANTHROPIC_DEFAULT_SONNET_MODEL": "deepseek-v4-pro",
-    "ANTHROPIC_DEFAULT_OPUS_MODEL": "deepseek-v4-pro",
+    "ANTHROPIC_MODEL": "glm-5.1",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "glm-5.1",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5.1",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "glm-5.1",
     "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
   }
@@ -329,7 +329,7 @@ function renderConfigs() {
 
 function renderEnv(envConfig) {
   els.envForm.innerHTML = envConfig.fields.map((field) => {
-    const wide = field.key === "SZTU_API_KEY" || field.key === "SZTU_DEFAULT_MODEL";
+    const wide = field.key === "SZTU_API_KEY" || field.key === "SZTU_DEFAULT_MODEL" || field.key === "CLAUDE_SZTU_FALLBACK_MODEL";
     const type = field.secret ? "password" : "text";
     return `
       <div class="env-field ${wide ? "wide" : ""}">

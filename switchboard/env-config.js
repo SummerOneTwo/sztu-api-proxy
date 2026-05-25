@@ -4,6 +4,7 @@ const { ENV_PATH } = require("../shared/env");
 const ENV_FIELDS = [
   { key: "SZTU_API_KEY", label: "SZTU API Key", secret: true },
   { key: "SZTU_DEFAULT_MODEL", label: "默认模型" },
+  { key: "CLAUDE_SZTU_FALLBACK_MODEL", label: "Claude Code 备用模型" },
   { key: "SZTU_DEFAULT_MAX_TOKENS", label: "默认输出 Token" },
   { key: "SZTU_MAX_TOKENS", label: "最大输出 Token" },
   { key: "OPENCODE_PROXY_PORT", label: "OpenCode 端口" },

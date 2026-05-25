@@ -291,8 +291,9 @@ deepseek-v4-pro
 Working strategy in the proxy:
 
 ```text
-model glm-5.1           -> proxy routes to glm-5.1
-model deepseek-v4-pro   -> proxy routes to deepseek-v4-pro
+Claude client model names are compatibility labels.
+Primary upstream = SZTU_DEFAULT_MODEL (default: glm-5.1).
+Fallback upstream = CLAUDE_SZTU_FALLBACK_MODEL (default: deepseek-v4-pro).
 ```
 
 Config example:
@@ -303,7 +304,7 @@ Config example:
     "ANTHROPIC_BASE_URL": "http://127.0.0.1:8790",
     "ANTHROPIC_API_KEY": "any",
     "ANTHROPIC_MODEL": "glm-5.1",
-    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "deepseek-v4-pro",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "glm-5.1",
     "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5.1"
   }
 }
@@ -311,9 +312,10 @@ Config example:
 
 During early testing, Claude Code CLI aliases such as `sonnet` and `haiku`
 were also used because some Claude Code versions reject arbitrary model names
-when passed on the command line. The proxy still accepts those Claude-looking
-model names as compatibility aliases, but the repository config uses the real
-SZTU model names.
+when passed on the command line. The proxy accepts Claude-looking names and
+real SZTU names as compatibility labels, but it routes all of them to the
+configured primary unless a safe fallback condition switches to the fallback
+model.
 
 ### Minimal Anthropic Compatibility
 
@@ -439,26 +441,32 @@ request exactly one tool call. Otherwise answer concisely.
 
 This keeps the old parser path available for fallback and regression checks.
 
-### Claude Code DeepSeek-Only Mode (2026-05)
+### Claude Code GLM-first Mode (2026-05)
 
-The Claude Code proxy is still optimized for `deepseek-v4-pro` only:
+The Claude Code proxy is optimized for `glm-5.1` as the primary engineering
+model:
 
 ```text
-All client model names map to SZTU_DEFAULT_MODEL (default: deepseek-v4-pro).
-GLM remains available for OpenCode/CodeBuddy/direct tests but is not the CC default.
+All client model names map to SZTU_DEFAULT_MODEL (default: glm-5.1).
+CLAUDE_SZTU_FALLBACK_MODEL defaults to deepseek-v4-pro for safe fallback.
 ```
 
 Reasoning is mapped per Claude Code request:
 
 ```text
-thinking.type = enabled  -> chat_template_kwargs.thinking = true
+thinking.type = enabled  -> GLM chat_template_kwargs.enable_thinking = true
 thinking.type = adaptive -> true
 thinking.type = disabled -> false
 (no thinking field)      -> true
 ```
 
-The proxy does not currently forward DeepSeek `reasoning_content` back to Claude
-Code thinking blocks; only final `content` is surfaced to the client.
+Safe fallback is allowed before tool execution history exists and after known
+read-only tools such as `Read`, `Glob`, `Grep`, `LS`, or MCP `*_file_read`.
+After side-effectful tools such as `Bash`, `Edit`, `Write`, generation, packing,
+or validation helpers, the proxy keeps the selected model instead of switching
+providers mid-loop. The proxy does not currently forward model
+`reasoning_content` back to Claude Code thinking blocks; only final `content` is
+surfaced to the client.
 
 Reference config: `claudecode/settings.json`.
 
@@ -682,7 +690,11 @@ node .\scripts\test-claudecode-proxy.js
 
 ### Verified Claude Code Commands
 
-GLM normal call:
+These commands exercise the active primary model configured by `.env`; the
+Claude Code `--model` value is a client compatibility label and does not force
+the upstream provider by itself.
+
+Default primary normal call with `SZTU_DEFAULT_MODEL=glm-5.1`:
 
 ```powershell
 claude -p --output-format json --model glm-5.1 "请只回复 GLM_OK"
@@ -697,22 +709,19 @@ Expected:
 }
 ```
 
-DeepSeek normal call:
+Fallback regression check with local mocks:
 
 ```powershell
-claude -p --output-format json --model deepseek-v4-pro "请只回复 DS_OK"
+node .\scripts\test-api.js fallback
 ```
 
 Expected:
 
-```json
-{
-  "result": "DS_OK",
-  "stop_reason": "end_turn"
-}
+```text
+claudecode fallback tests ok
 ```
 
-GLM Read tool call:
+Default primary Read tool call with `SZTU_DEFAULT_MODEL=glm-5.1`:
 
 ```powershell
 claude -p --output-format json --model glm-5.1 "请读取 CLAUDE.md，然后只回复 GLM_READ_OK"
@@ -727,19 +736,16 @@ Observed successful result:
 }
 ```
 
-DeepSeek Read tool call:
+Read-tool fallback is covered by the local fallback suite:
 
 ```powershell
-claude -p --output-format json --model deepseek-v4-pro "必须调用 Read 工具读取 CLAUDE.md，然后只回复 DS_READ_OK"
+node .\scripts\test-claudecode-fallback.js
 ```
 
 Observed successful result:
 
-```json
-{
-  "num_turns": 2,
-  "result": "DS_READ_OK"
-}
+```text
+claudecode fallback tests ok
 ```
 
 Note: if the prompt asks for a missing file, Claude Code may execute a search
@@ -756,7 +762,9 @@ Known limitations:
   real-world coverage.
 - If the upstream model returns text instead of `tool_calls`, fallback parser
   quality still depends on model formatting.
-- GLM can be unstable behind SZTU/APISIX and sometimes returns 502.
+- GLM is the Claude Code primary target, but can still be unstable behind
+  SZTU/APISIX. 5xx/network failures and 200 empty streams can fall back to
+  DeepSeek when no side-effectful tool history exists.
 - Long Claude Code system prompts make requests expensive in prompt tokens.
 - Image/document inputs are currently omitted as text placeholders.
 

@@ -15,7 +15,8 @@ const CLAUDE_DIR = __dirname;
 const RUNTIME_DIR = path.join(CLAUDE_DIR, ".runtime");
 const LOG_PATH = path.join(RUNTIME_DIR, "claudecode-proxy.log");
 const PID_PATH = path.join(RUNTIME_DIR, PORT === 8790 ? "claudecode-proxy.pid" : `claudecode-proxy-${PORT}.pid`);
-const DEFAULT_MODEL = process.env.SZTU_DEFAULT_MODEL || "deepseek-v4-pro";
+const DEFAULT_MODEL = process.env.SZTU_DEFAULT_MODEL || "glm-5.1";
+const FALLBACK_MODEL = process.env.CLAUDE_SZTU_FALLBACK_MODEL || "deepseek-v4-pro";
 const DEFAULT_MAX_TOKENS = envNumber("SZTU_DEFAULT_MAX_TOKENS", 32768);
 const MAX_TOKENS = envNumber("SZTU_MAX_TOKENS", 32768);
 const THINKING_MIN_MAX_TOKENS = envNumber("SZTU_THINKING_MIN_MAX_TOKENS", 10000);
@@ -28,7 +29,7 @@ const FAILURE_STATUS = Math.max(400, Math.trunc(envNumber("CLAUDE_SZTU_FAILURE_S
 const TOOL_MODES = new Set(["native", "prompt", "strict"]);
 const TOOL_HISTORY_MODES = new Set(["text", "structured"]);
 
-function resolveDeepseekThinking(body) {
+function resolveClaudeThinking(body) {
   const config = body?.thinking;
   if (config && typeof config === "object") {
     if (config.type === "enabled" || config.type === "adaptive") {
@@ -40,6 +41,8 @@ function resolveDeepseekThinking(body) {
   }
   return true;
 }
+
+const resolveDeepseekThinking = resolveClaudeThinking;
 
 function chatTemplateKwargs(model, thinking) {
   if (model === "deepseek-v4-pro") {
@@ -60,7 +63,7 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-const resolveUpstreamThinking = resolveDeepseekThinking;
+const resolveUpstreamThinking = resolveClaudeThinking;
 
 function failureStatus() {
   return FAILURE_STATUS;
@@ -139,8 +142,97 @@ function normalizeMaxTokens(value, thinking = false) {
   return requested;
 }
 
-function upstreamModel() {
-  return DEFAULT_MODEL;
+function upstreamModel(requestedModel, options = {}) {
+  return options.model || DEFAULT_MODEL;
+}
+
+function fallbackModelFor(upstreamBody) {
+  const fallback = String(FALLBACK_MODEL || "").trim();
+  if (!fallback || fallback === upstreamBody?.model) {
+    return "";
+  }
+  return fallback;
+}
+
+function isRetryableFallbackStatus(status) {
+  return Number(status) >= 500;
+}
+
+function isReadOnlyToolName(name) {
+  const lower = String(name || "").toLowerCase();
+  return new Set([
+    "read",
+    "ls",
+    "glob",
+    "grep",
+    "listmcpresourcestool",
+    "readmcpresourcetool",
+    "webfetch",
+    "websearch",
+  ]).has(lower) || lower.endsWith("__file_read");
+}
+
+function toolExecutionSafety(body) {
+  const toolNamesById = new Map();
+  let hasExecution = false;
+  let unsafe = false;
+
+  for (const message of Array.isArray(body?.messages) ? body.messages : []) {
+    if (!message || typeof message !== "object") {
+      continue;
+    }
+    if (Array.isArray(message.tool_calls)) {
+      for (const toolCall of message.tool_calls) {
+        hasExecution = true;
+        const name = toolCall?.function?.name || toolCall?.name;
+        if (toolCall?.id && name) {
+          toolNamesById.set(toolCall.id, name);
+        }
+        if (!isReadOnlyToolName(name)) {
+          unsafe = true;
+        }
+      }
+    }
+    if (message.role === "tool") {
+      hasExecution = true;
+      const name = toolNamesById.get(message.tool_call_id);
+      if (!isReadOnlyToolName(name)) {
+        unsafe = true;
+      }
+    }
+    if (Array.isArray(message.content)) {
+      for (const part of message.content) {
+        if (part?.type === "tool_use") {
+          hasExecution = true;
+          if (part.id && part.name) {
+            toolNamesById.set(part.id, part.name);
+          }
+          if (!isReadOnlyToolName(part.name)) {
+            unsafe = true;
+          }
+        } else if (part?.type === "tool_result") {
+          hasExecution = true;
+          const name = toolNamesById.get(part.tool_use_id);
+          if (!isReadOnlyToolName(name)) {
+            unsafe = true;
+          }
+        }
+      }
+    }
+  }
+  return { hasExecution, unsafe };
+}
+
+function hasToolExecutionHistory(body) {
+  return toolExecutionSafety(body).hasExecution;
+}
+
+function hasUnsafeToolExecutionHistory(body) {
+  return toolExecutionSafety(body).unsafe;
+}
+
+function shouldFallbackToModel(body, upstreamBody) {
+  return Boolean(fallbackModelFor(upstreamBody)) && !hasUnsafeToolExecutionHistory(body);
 }
 
 function contentToText(content) {
@@ -261,7 +353,7 @@ function anthropicMessagesToOpenAI(body, options = {}) {
         for (const part of toolResults) {
           messages.push({
             role: "user",
-            content: `Tool result:\n${contentToText(part.content)}\n\nContinue the user's task. If more inspection, edits, or commands are needed, request exactly one tool call. Otherwise answer concisely.`,
+            content: `Tool result:\n${contentToText(part.content)}\n\nThe tool call above has already completed. Do not repeat the same tool call just to read the same result again. Continue the user's task. If more inspection, edits, or commands are needed, request exactly one new tool call. Otherwise answer concisely.`,
           });
         }
         const rest = message.content.filter((part) => part?.type !== "tool_result");
@@ -560,7 +652,7 @@ function openAiToolChoice(toolChoice, toolNameMaps) {
 }
 
 function buildUpstreamRequest(body, options = {}) {
-  const model = upstreamModel(body.model);
+  const model = upstreamModel(body.model, { model: options.upstreamModel || options.model });
   const thinking = resolveUpstreamThinking(body);
   const maxTokens = normalizeMaxTokens(body.max_tokens, thinking);
   const toolMode = resolveToolMode(options.toolMode);
@@ -824,12 +916,19 @@ function streamAnthropicFromUpstream(res, upstreamRes, requestedModel, tools, re
     },
   };
 
-  res.writeHead(upstreamRes.status, {
-    "content-type": "text/event-stream; charset=utf-8",
-    "cache-control": "no-cache",
-    connection: "keep-alive",
-  });
-  writeSse(res, "message_start", createdMessage);
+  let responseStarted = false;
+  function startResponse(status = upstreamRes.status) {
+    if (responseStarted) {
+      return;
+    }
+    responseStarted = true;
+    res.writeHead(status, {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-cache",
+      connection: "keep-alive",
+    });
+    writeSse(res, "message_start", createdMessage);
+  }
 
   let buffer = "";
   let text = "";
@@ -867,9 +966,11 @@ function streamAnthropicFromUpstream(res, upstreamRes, requestedModel, tools, re
     }
     const delta = choice.delta || {};
     if (typeof delta.content === "string" && delta.content) {
+      startResponse();
       text += delta.content;
     }
     for (const toolCall of delta.tool_calls || []) {
+      startResponse();
       const key = Number.isInteger(toolCall.index) ? toolCall.index : nativeToolCalls.size;
       const current = nativeToolCalls.get(key) || {
         id: toolCall.id || `toolu_${Date.now().toString(36)}_${key}`,
@@ -963,6 +1064,30 @@ function streamAnthropicFromUpstream(res, upstreamRes, requestedModel, tools, re
       options.toolNameMaps,
     );
     const parsedTools = nativeTools.length > 0 ? nativeTools : parseToolsWithLog(text, tools, requestId, true);
+    const emptyStream = nativeTools.length === 0 && parsedTools.length === 0 && !text;
+    if (emptyStream && typeof options.onEmptyStream === "function") {
+      log("stream-empty-fallback", {
+        requestId,
+        model: options.model,
+        durationMs: durationMs(startedAt),
+      });
+      const fallback = await options.onEmptyStream();
+      if (fallback?.handled) {
+        return;
+      }
+      if (fallback?.upstreamRes) {
+        streamAnthropicFromUpstream(res, fallback.upstreamRes, requestedModel, tools, requestId, startedAt, {
+          ...options,
+          toolNameMaps: fallback.toolNameMaps || options.toolNameMaps,
+          toolMode: fallback.toolMode || options.toolMode,
+          model: fallback.model || options.model,
+          fallbackUsed: true,
+          onEmptyStream: undefined,
+        });
+        return;
+      }
+    }
+    startResponse();
     if (parsedTools.length > 0) {
       parsedTools.forEach((parsedTool, index) => {
         const inputJson = JSON.stringify(parsedTool.input || {});
@@ -1011,6 +1136,8 @@ function streamAnthropicFromUpstream(res, upstreamRes, requestedModel, tools, re
       status: upstreamRes.status,
       stop_reason: stop,
       usage,
+      model: options.model,
+      fallbackUsed: options.fallbackUsed,
       nativeToolCalls: nativeTools.length,
       fallbackParserUsed: nativeTools.length === 0 && parsedTools.length > 0,
       textChars: text.length,
@@ -1019,9 +1146,37 @@ function streamAnthropicFromUpstream(res, upstreamRes, requestedModel, tools, re
     res.end();
   })().catch((error) => {
     log("stream-error", { requestId, durationMs: durationMs(startedAt), error });
+    if (res.destroyed || res.writableEnded) {
+      return;
+    }
+    if (!responseStarted && !res.headersSent) {
+      writeJson(res, failureStatus(), { error: { type: "api_error", message: error.message } });
+      return;
+    }
     if (!res.destroyed) {
       res.end();
     }
+  });
+}
+
+function sendUpstreamRequest(apiKey, upstreamBody) {
+  return fetchWithRetry(UPSTREAM_URL, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${apiKey}`,
+      "content-type": "application/json",
+      accept: upstreamBody.stream ? "text/event-stream" : "application/json",
+    },
+    body: JSON.stringify(upstreamBody),
+  });
+}
+
+function fallbackRequestFor(body, upstreamRequest, fallbackModel) {
+  return buildUpstreamRequest(body, {
+    upstreamModel: fallbackModel,
+    toolMode: upstreamRequest.toolMode,
+    toolHistoryMode: upstreamRequest.toolHistoryMode,
+    toolNameMaps: upstreamRequest.toolNameMaps,
   });
 }
 
@@ -1035,9 +1190,11 @@ function proxyMessages(req, res, body) {
     return;
   }
 
-  const upstreamRequest = buildUpstreamRequest(body);
-  const { upstreamBody, toolMode, toolHistoryMode, toolNameMaps, forwardedToolCount } = upstreamRequest;
+  let upstreamRequest = buildUpstreamRequest(body);
+  let { upstreamBody, toolMode, toolHistoryMode, toolNameMaps, forwardedToolCount } = upstreamRequest;
   const upstreamThinking = resolveUpstreamThinking(body);
+  const fallbackModel = fallbackModelFor(upstreamBody);
+  const fallbackEligible = shouldFallbackToModel(body, upstreamBody);
   log("request", {
     requestId,
     method: req.method,
@@ -1050,33 +1207,88 @@ function proxyMessages(req, res, body) {
     toolMode,
     toolHistoryMode,
     forwardedToolCount,
+    fallbackModel: fallbackEligible ? fallbackModel : undefined,
   });
 
-  const payload = JSON.stringify(upstreamBody);
-  const upstream = fetchWithRetry(UPSTREAM_URL, {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${apiKey}`,
-      "content-type": "application/json",
-      accept: upstreamBody.stream ? "text/event-stream" : "application/json",
-    },
-    body: payload,
-  });
-
-  upstream
-    .then(async (upstreamRes) => {
-      log("upstream-response-start", {
+  (async () => {
+    let usedFallback = false;
+    let upstreamRes;
+    try {
+      upstreamRes = await sendUpstreamRequest(apiKey, upstreamBody);
+    } catch (error) {
+      if (!fallbackEligible) {
+        throw error;
+      }
+      const fallbackRequest = fallbackRequestFor(body, upstreamRequest, fallbackModel);
+      log("upstream-fallback", {
         requestId,
-        status: upstreamRes.status,
-        contentType: upstreamRes.headers.get("content-type"),
+        reason: "network-error",
+        fromModel: upstreamBody.model,
+        toModel: fallbackModel,
+        error: error.message,
         durationMs: durationMs(startedAt),
       });
+      upstreamRequest = fallbackRequest;
+      ({ upstreamBody, toolMode, toolHistoryMode, toolNameMaps, forwardedToolCount } = upstreamRequest);
+      usedFallback = true;
+      upstreamRes = await sendUpstreamRequest(apiKey, upstreamBody);
+    }
+
+    async function fallbackFromStatusIfNeeded(currentRes) {
+      log("upstream-response-start", {
+        requestId,
+        status: currentRes.status,
+        contentType: currentRes.headers.get("content-type"),
+        model: upstreamBody.model,
+        durationMs: durationMs(startedAt),
+      });
+
+      if (!currentRes.ok && fallbackEligible && !usedFallback && isRetryableFallbackStatus(currentRes.status)) {
+        const text = await currentRes.text();
+        log("upstream-error-response", {
+          requestId,
+          status: currentRes.status,
+          model: upstreamBody.model,
+          fallbackEligible: true,
+          bodyPreview: preview(text, 2000),
+          durationMs: durationMs(startedAt),
+        });
+        const fallbackRequest = fallbackRequestFor(body, upstreamRequest, fallbackModel);
+        log("upstream-fallback", {
+          requestId,
+          reason: "status",
+          status: currentRes.status,
+          fromModel: upstreamBody.model,
+          toModel: fallbackModel,
+          durationMs: durationMs(startedAt),
+        });
+        upstreamRequest = fallbackRequest;
+        ({ upstreamBody, toolMode, toolHistoryMode, toolNameMaps, forwardedToolCount } = upstreamRequest);
+        usedFallback = true;
+        const fallbackRes = await sendUpstreamRequest(apiKey, upstreamBody);
+        log("upstream-response-start", {
+          requestId,
+          status: fallbackRes.status,
+          contentType: fallbackRes.headers.get("content-type"),
+          model: upstreamBody.model,
+          fallback: true,
+          durationMs: durationMs(startedAt),
+        });
+        return fallbackRes;
+      }
+      return currentRes;
+    }
+
+    upstreamRes = await fallbackFromStatusIfNeeded(upstreamRes);
+
       if (upstreamBody.stream) {
         if (!upstreamRes.ok) {
           const text = await upstreamRes.text();
           log("upstream-error-response", {
             requestId,
             status: upstreamRes.status,
+            model: upstreamBody.model,
+            fallbackUsed: usedFallback,
             bodyPreview: preview(text, 2000),
             durationMs: durationMs(startedAt),
           });
@@ -1092,7 +1304,60 @@ function proxyMessages(req, res, body) {
           writeJson(res, 502, { error: { type: "api_error", message: "missing upstream stream body" } });
           return;
         }
-        streamAnthropicFromUpstream(res, upstreamRes, body.model, body.tools, requestId, startedAt, { toolNameMaps, toolMode });
+        const streamOptions = { toolNameMaps, toolMode, model: upstreamBody.model, fallbackUsed: usedFallback };
+        if (fallbackEligible && !usedFallback) {
+          streamOptions.onEmptyStream = async () => {
+            const fallbackRequest = fallbackRequestFor(body, upstreamRequest, fallbackModel);
+            log("upstream-fallback", {
+              requestId,
+              reason: "empty-stream",
+              fromModel: upstreamBody.model,
+              toModel: fallbackModel,
+              durationMs: durationMs(startedAt),
+            });
+            upstreamRequest = fallbackRequest;
+            ({ upstreamBody, toolMode, toolHistoryMode, toolNameMaps, forwardedToolCount } = upstreamRequest);
+            usedFallback = true;
+            const fallbackRes = await sendUpstreamRequest(apiKey, upstreamBody);
+            log("upstream-response-start", {
+              requestId,
+              status: fallbackRes.status,
+              contentType: fallbackRes.headers.get("content-type"),
+              model: upstreamBody.model,
+              fallback: true,
+              durationMs: durationMs(startedAt),
+            });
+            if (!fallbackRes.ok) {
+              const text = await fallbackRes.text();
+              log("upstream-error-response", {
+                requestId,
+                status: fallbackRes.status,
+                model: upstreamBody.model,
+                fallbackUsed: true,
+                bodyPreview: preview(text, 2000),
+                durationMs: durationMs(startedAt),
+              });
+              writeJson(res, failureStatus(), {
+                error: {
+                  type: "api_error",
+                  message: text.slice(0, 1000) || `upstream returned ${fallbackRes.status}`,
+                },
+              });
+              return { handled: true };
+            }
+            if (!fallbackRes.body) {
+              writeJson(res, 502, { error: { type: "api_error", message: "missing fallback stream body" } });
+              return { handled: true };
+            }
+            return {
+              upstreamRes: fallbackRes,
+              toolNameMaps,
+              toolMode,
+              model: upstreamBody.model,
+            };
+          };
+        }
+        streamAnthropicFromUpstream(res, upstreamRes, body.model, body.tools, requestId, startedAt, streamOptions);
         return;
       }
 
@@ -1101,6 +1366,8 @@ function proxyMessages(req, res, body) {
         log("upstream-error-response", {
           requestId,
           status: upstreamRes.status,
+          model: upstreamBody.model,
+          fallbackUsed: usedFallback,
           bodyPreview: preview(text, 2000),
           durationMs: durationMs(startedAt),
         });
@@ -1121,13 +1388,14 @@ function proxyMessages(req, res, body) {
         usage: anthropic.usage,
         contentTypes: anthropic.content.map((part) => part.type),
         toolMode,
+        model: upstreamBody.model,
+        fallbackUsed: usedFallback,
         nativeToolCalls: anthropic.content.filter((part) => part.type === "tool_use").length,
         durationMs: durationMs(startedAt),
       });
       writeJson(res, 200, anthropic);
-    })
-    .catch((error) => {
-      log("proxy-error", { requestId, durationMs: durationMs(startedAt), error });
+  })().catch((error) => {
+      log("proxy-error", { requestId, model: upstreamBody?.model, durationMs: durationMs(startedAt), error });
       writeJson(res, failureStatus(), { error: { type: "api_error", message: error.message } });
     });
 }
@@ -1149,7 +1417,12 @@ const server = http.createServer(async (req, res) => {
   try {
     const pathName = new URL(req.url || "/", `http://${HOST}:${PORT}`).pathname;
     if (req.method === "GET" && pathName === "/health") {
-      writeJson(res, 200, { ok: true, primary: DEFAULT_MODEL, models: [DEFAULT_MODEL] });
+      writeJson(res, 200, {
+        ok: true,
+        primary: DEFAULT_MODEL,
+        fallback: fallbackModelFor({ model: DEFAULT_MODEL }) || null,
+        models: [DEFAULT_MODEL, fallbackModelFor({ model: DEFAULT_MODEL })].filter(Boolean),
+      });
       return;
     }
     if (req.method === "POST" && pathName === "/v1/messages/count_tokens") {
@@ -1177,6 +1450,7 @@ function startServer() {
       host: HOST,
       port: PORT,
       model: DEFAULT_MODEL,
+      fallbackModel: fallbackModelFor({ model: DEFAULT_MODEL }) || undefined,
       upstreamTimeoutMs: UPSTREAM_TIMEOUT_MS,
       streamReadTimeoutMs: STREAM_READ_TIMEOUT_MS,
       streamTotalTimeoutMs: STREAM_TOTAL_TIMEOUT_MS,
@@ -1221,10 +1495,17 @@ module.exports = {
   contentToText,
   boundedToolParseText,
   createToolNameMaps,
+  fallbackModelFor,
+  hasToolExecutionHistory,
+  hasUnsafeToolExecutionHistory,
+  isRetryableFallbackStatus,
+  isReadOnlyToolName,
   resolveToolHistoryMode,
   resolveToolMode,
+  resolveClaudeThinking,
   resolveDeepseekThinking,
   selectRelevantTools,
+  shouldFallbackToModel,
   startServer,
   toAnthropicMessage,
   upstreamToolName,
