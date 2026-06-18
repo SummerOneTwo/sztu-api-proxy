@@ -23,6 +23,18 @@
             "supportsToolCall": true,
             "supportsImages": false,
             "supportsReasoning": true
+        },
+        {
+            "id": "deepseek-v4-pro-instruct",
+            "name": "deepseek-v4-pro-instruct",
+            "vendor": "SZTU",
+            "apiKey": "any",
+            "maxInputTokens": 65536,
+            "maxOutputTokens": 8192,
+            "url": "http://127.0.0.1:8787/v1/chat/completions",
+            "supportsToolCall": true,
+            "supportsImages": false,
+            "supportsReasoning": false
         }
     ]
 }

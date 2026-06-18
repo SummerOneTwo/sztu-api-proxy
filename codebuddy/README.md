@@ -6,6 +6,7 @@ The CodeBuddy proxy supports both SZTU models:
 
 - `glm-5.1`
 - `deepseek-v4-pro`
+- `deepseek-v4-pro-instruct` (same upstream model, `thinking=false` — matches CK-Bench L2 judge)
 
 Both models are exposed as local custom models through `models.json` and route
 to:
@@ -36,7 +37,9 @@ Invoke-RestMethod http://127.0.0.1:8787/health
 - GLM defaults to `chat_template_kwargs.enable_thinking=false` for CodeBuddy
   traffic. This avoids empty final content when the output budget is spent on
   reasoning tokens.
-- DeepSeek keeps the existing `thinking=true` / `reasoning_effort=max` behavior.
+- DeepSeek `deepseek-v4-pro` keeps `thinking=true` / `reasoning_effort=max`.
+- DeepSeek `deepseek-v4-pro-instruct` routes to the same upstream model with
+  `chat_template_kwargs.thinking=false` (CK-Bench agent eval default).
 - `max_completion_tokens` and `max_output_tokens` are normalized to
   `max_tokens` and clamped by `SZTU_DEFAULT_MAX_TOKENS` / `SZTU_MAX_TOKENS`.
 - Upstream 5xx errors are retried up to 3 attempts before returning the error to

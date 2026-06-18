@@ -38,18 +38,31 @@ function normalizeMaxTokens(value) {
   return Math.min(Math.trunc(n), SZTU_DEFAULT_MAX_TOKENS, SZTU_MAX_TOKENS);
 }
 
-function normalizeModel(value) {
+const DSV4_INSTRUCT_ALIASES = new Set([
+  "deepseek-v4-pro-instruct",
+  "deepseek-v4-pro-nothink",
+]);
+
+function resolveModel(value) {
   const raw = typeof value === "string" ? value : "";
   const model = raw.split(":").pop().split("/").pop();
-  if (model === "deepseek-v4-pro") {
-    return "deepseek-v4-pro";
+  if (DSV4_INSTRUCT_ALIASES.has(model)) {
+    return { apiModel: "deepseek-v4-pro", thinking: false };
   }
-  return "glm-5.1";
+  if (model === "deepseek-v4-pro") {
+    return { apiModel: "deepseek-v4-pro", thinking: true };
+  }
+  return { apiModel: "glm-5.1", thinking: false };
+}
+
+function normalizeModel(value) {
+  return resolveModel(value).apiModel;
 }
 
 function sanitizeBody(body) {
   const next = { ...body };
-  next.model = normalizeModel(next.model);
+  const resolved = resolveModel(next.model);
+  next.model = resolved.apiModel;
 
   const requestedMaxTokens = normalizeMaxTokens(
     next.max_tokens ?? next.max_completion_tokens ?? next.max_output_tokens
@@ -79,11 +92,19 @@ function sanitizeBody(body) {
     ? next.chat_template_kwargs
     : {};
   if (next.model === "deepseek-v4-pro") {
-    next.chat_template_kwargs = {
-      ...template,
-      thinking: true,
-      reasoning_effort: "max",
-    };
+    if (resolved.thinking) {
+      next.chat_template_kwargs = {
+        ...template,
+        thinking: true,
+        reasoning_effort: "max",
+      };
+    } else {
+      // Same default as CK-Bench L2/L3 judge: faster, no reasoning tokens.
+      next.chat_template_kwargs = {
+        ...template,
+        thinking: false,
+      };
+    }
   } else {
     next.chat_template_kwargs = {
       enable_thinking: false,
@@ -541,7 +562,10 @@ const server = http.createServer((req, res) => {
   const startedAt = Date.now();
   const pathName = new URL(req.url || "/", `http://127.0.0.1:${PORT}`).pathname;
   if (req.method === "GET" && pathName === "/health") {
-    writeJson(res, 200, { ok: true, models: ["glm-5.1", "deepseek-v4-pro"] });
+    writeJson(res, 200, {
+      ok: true,
+      models: ["glm-5.1", "deepseek-v4-pro", "deepseek-v4-pro-instruct"],
+    });
     return;
   }
   if (req.method === "GET" && pathName === "/v1/models") {
@@ -550,6 +574,12 @@ const server = http.createServer((req, res) => {
       data: [
         { id: "glm-5.1", object: "model", created: 0, owned_by: "sztu" },
         { id: "deepseek-v4-pro", object: "model", created: 0, owned_by: "sztu" },
+        {
+          id: "deepseek-v4-pro-instruct",
+          object: "model",
+          created: 0,
+          owned_by: "sztu",
+        },
       ],
     });
     return;
