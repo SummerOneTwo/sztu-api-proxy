@@ -6,7 +6,6 @@ loadDotEnv();
 const UPSTREAM_URL = process.env.SZTU_UPSTREAM_URL || "https://apiai.sztu.edu.cn/v1/chat/completions";
 const OPENCODE_URL = `http://127.0.0.1:${envNumber("OPENCODE_PROXY_PORT", 8788)}/v1/chat/completions`;
 const CODEBUDDY_CHAT_URL = `http://127.0.0.1:${envNumber("CODEBUDDY_PROXY_PORT", envNumber("PORT", 8787))}/v1/chat/completions`;
-const CODEBUDDY_RESPONSES_URL = `http://127.0.0.1:${envNumber("CODEBUDDY_PROXY_PORT", envNumber("PORT", 8787))}/v1/responses`;
 
 const DEFAULT_TIMEOUT_MS = envNumber("TEST_TIMEOUT_MS", 120000);
 
@@ -230,19 +229,6 @@ async function testCodeBuddy() {
     "deepseek-v4-pro-max",
     "DS_MAX_OK"
   ));
-  ok.push(await testCase("codebuddy proxy responses non-stream", async () => {
-    const res = await postJson(CODEBUDDY_RESPONSES_URL, {
-      model: "deepseek-v4-pro-instruct",
-      input: "请只回复 RESP_OK",
-      max_output_tokens: 128,
-    });
-    assertOk(res.status === 200, `status=${res.status} body=${res.text.slice(0, 300)}`);
-    const json = parseJson(res.text);
-    const text = json?.output?.[0]?.content?.[0]?.text || "";
-    assertOk(text.includes("RESP_OK"), `unexpected response text=${JSON.stringify(text)}`);
-    assertOk(json?.usage?.input_tokens !== undefined, "missing response usage");
-    return `usage=${json.usage.input_tokens}/${json.usage.output_tokens}`;
-  }));
   return ok;
 }
 

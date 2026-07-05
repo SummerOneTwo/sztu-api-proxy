@@ -220,91 +220,8 @@ function flattenContent(content) {
     .join("\n");
 }
 
-function responsesToChatCompletions(body) {
-  const messages = [];
-
-  if (typeof body?.instructions === "string" && body.instructions.trim()) {
-    messages.push({
-      role: "system",
-      content: body.instructions,
-    });
-  }
-
-  if (Array.isArray(body?.input)) {
-    for (const item of body.input) {
-      if (!item || typeof item !== "object") {
-        continue;
-      }
-
-      const role = typeof item.role === "string" ? item.role : "user";
-      const content = flattenContent(item.content);
-      if (!content) {
-        continue;
-      }
-
-      messages.push({ role, content });
-    }
-  } else if (typeof body?.input === "string" && body.input.trim()) {
-    messages.push({
-      role: "user",
-      content: body.input,
-    });
-  }
-
-  return sanitizeBody({
-    model: body.model,
-    messages,
-    stream: body.stream === true,
-    stream_options: body.stream === true ? { include_usage: true } : undefined,
-    max_tokens: body.max_output_tokens || body.max_tokens,
-    tools: body.tools,
-    tool_choice: body.tool_choice,
-    parallel_tool_calls: body.parallel_tool_calls,
-    chat_template_kwargs: body.chat_template_kwargs,
-  });
-}
-
-function chatCompletionsToResponses(payload) {
-  const message = payload?.choices?.[0]?.message || {};
-  const text = typeof message.content === "string" ? message.content : "";
-  const createdAt = typeof payload?.created === "number" ? payload.created : Math.floor(Date.now() / 1000);
-
-  return {
-    id: payload?.id || `resp_${Date.now()}`,
-    object: "response",
-    created_at: createdAt,
-    status: "completed",
-    model: payload?.model,
-    output: [
-      {
-        type: "message",
-        id: `msg_${Date.now()}`,
-        status: "completed",
-        role: "assistant",
-        content: [
-          {
-            type: "output_text",
-            text,
-            annotations: [],
-          },
-        ],
-      },
-    ],
-    output_text: text,
-    tool_calls: message.tool_calls,
-    usage: payload?.usage
-      ? {
-        input_tokens: payload.usage.prompt_tokens || 0,
-        output_tokens: payload.usage.completion_tokens || 0,
-        total_tokens: payload.usage.total_tokens || 0,
-      }
-      : undefined,
-  };
-}
-
 function summarizeCodebuddyBody(body) {
   const messages = Array.isArray(body?.messages) ? body.messages : [];
-  const inputItems = Array.isArray(body?.input) ? body.input : [];
   const contentChars = messages.reduce((sum, message) => {
     const content = typeof message?.content === "string" ? message.content : flattenContent(message?.content);
     return sum + content.length;
@@ -314,25 +231,12 @@ function summarizeCodebuddyBody(body) {
     model: body?.model,
     stream: body?.stream === true,
     messages: messages.length || undefined,
-    input_items: inputItems.length || undefined,
     content_chars: contentChars || undefined,
     tools: Array.isArray(body?.tools) ? body.tools.length : undefined,
     tool_choice: body?.tool_choice,
     max_tokens: body?.max_tokens,
     max_completion_tokens: body?.max_completion_tokens,
   };
-}
-
-function writeSse(res, payload, eventName) {
-  if (eventName) {
-    res.write(`event: ${eventName}\n`);
-  }
-  res.write(`data: ${JSON.stringify(payload)}\n\n`);
-}
-
-function writeSseDone(res) {
-  res.write("data: [DONE]\n\n");
-  res.end();
 }
 
 function forwardChatCompletionStream(res, upstreamRes, requestId, startedAt) {
@@ -354,158 +258,6 @@ function forwardChatCompletionStream(res, upstreamRes, requestId, startedAt) {
     });
   });
   upstreamRes.pipe(res);
-}
-
-function emitResponsesStreamFromChatStream(res, upstreamRes, requestId, startedAt) {
-  const createdAt = Math.floor(Date.now() / 1000);
-  const responseId = `resp_${Date.now()}`;
-  let model;
-  let outputText = "";
-  let usage;
-  let finishReason = "stop";
-  let buffer = "";
-  let completed = false;
-
-  res.writeHead(upstreamRes.statusCode || 200, {
-    "Content-Type": "text/event-stream; charset=utf-8",
-    "Cache-Control": "no-cache",
-    Connection: "keep-alive",
-  });
-
-  writeSse(
-    res,
-    {
-      id: responseId,
-      object: "response",
-      created_at: createdAt,
-      status: "in_progress",
-      type: "response.created",
-    },
-    "response.created"
-  );
-
-  function complete() {
-    if (completed) {
-      return;
-    }
-    completed = true;
-    writeSse(
-      res,
-      {
-        id: responseId,
-        object: "response",
-        created_at: createdAt,
-        status: "completed",
-        type: "response.completed",
-        model,
-        output: [
-          {
-            type: "message",
-            id: `msg_${Date.now()}`,
-            status: "completed",
-            role: "assistant",
-            content: [
-              {
-                type: "output_text",
-                text: outputText,
-                annotations: [],
-              },
-            ],
-          },
-        ],
-        output_text: outputText,
-        usage: usage
-          ? {
-            input_tokens: usage.prompt_tokens || 0,
-            output_tokens: usage.completion_tokens || 0,
-            total_tokens: usage.total_tokens || 0,
-          }
-          : undefined,
-        finish_reason: finishReason,
-      },
-      "response.completed"
-    );
-    writeSseDone(res);
-  }
-
-  function handleEvent(eventText) {
-    const dataLines = eventText
-      .split(/\r?\n/)
-      .filter((line) => line.startsWith("data:"))
-      .map((line) => line.slice(5).trimStart());
-    if (dataLines.length === 0) {
-      return;
-    }
-
-    const dataText = dataLines.join("\n");
-    if (dataText === "[DONE]") {
-      complete();
-      return;
-    }
-
-    let chunk;
-    try {
-      chunk = JSON.parse(dataText);
-    } catch (error) {
-      log("invalid-upstream-sse-json", { requestId, error, dataPreview: preview(dataText, 1000) });
-      return;
-    }
-
-    if (chunk.model && !model) {
-      model = chunk.model;
-    }
-    if (chunk.usage) {
-      usage = chunk.usage;
-    }
-
-    const choice = Array.isArray(chunk.choices) ? chunk.choices[0] : undefined;
-    if (!choice) {
-      return;
-    }
-    if (choice.finish_reason) {
-      finishReason = choice.finish_reason;
-    }
-
-    const delta = choice.delta || {};
-    if (typeof delta.content === "string" && delta.content) {
-      outputText += delta.content;
-      writeSse(
-        res,
-        {
-          type: "response.output_text.delta",
-          response_id: responseId,
-          output_index: 0,
-          content_index: 0,
-          delta: delta.content,
-        },
-        "response.output_text.delta"
-      );
-    }
-  }
-
-  upstreamRes.on("data", (chunk) => {
-    buffer += chunk.toString("utf8");
-    const parts = buffer.split(/\r?\n\r?\n/);
-    buffer = parts.pop() || "";
-    for (const part of parts) {
-      handleEvent(part);
-    }
-  });
-
-  upstreamRes.on("end", () => {
-    if (buffer.trim()) {
-      handleEvent(buffer);
-    }
-    complete();
-    log("responses-stream-response", {
-      requestId,
-      status: upstreamRes.statusCode,
-      usage,
-      finishReason,
-      outputChars: outputText.length,
-      durationMs: durationMs(startedAt),
-    });
-  });
 }
 
 function delay(ms) {
@@ -620,7 +372,7 @@ const server = http.createServer((req, res) => {
     });
     return;
   }
-  if (req.method !== "POST" || (pathName !== "/v1/chat/completions" && pathName !== "/v1/responses")) {
+  if (req.method !== "POST" || pathName !== "/v1/chat/completions") {
     log("not-found", { requestId, method: req.method, url: req.url, pathName });
     writeJson(res, 404, { error: "not found" });
     return;
@@ -640,10 +392,9 @@ const server = http.createServer((req, res) => {
       return;
     }
 
-    const isResponsesApi = pathName === "/v1/responses";
     let nextBody;
     try {
-      nextBody = isResponsesApi ? responsesToChatCompletions(body) : sanitizeBody(body);
+      nextBody = sanitizeBody(body);
     } catch (error) {
       if (error && error.code === "UNSUPPORTED_MODEL") {
         log("unsupported-model", { requestId, model: body?.model });
@@ -665,7 +416,6 @@ const server = http.createServer((req, res) => {
       requestId,
       method: req.method,
       url: req.url,
-      isResponsesApi,
       client: summarizeSharedBody(body),
       sanitized: summarizeCodebuddyBody(nextBody),
       upstream: summarizeSharedBody(upstreamBody),
@@ -675,11 +425,7 @@ const server = http.createServer((req, res) => {
     requestUpstreamWithRetry(payload, apiKey, wantsStream, requestId, startedAt)
       .then((result) => {
         if (result.type === "stream") {
-          if (isResponsesApi) {
-            emitResponsesStreamFromChatStream(res, result.upstreamRes, requestId, startedAt);
-          } else {
-            forwardChatCompletionStream(res, result.upstreamRes, requestId, startedAt);
-          }
+          forwardChatCompletionStream(res, result.upstreamRes, requestId, startedAt);
           return;
         }
 
@@ -709,19 +455,14 @@ const server = http.createServer((req, res) => {
             finishReason: parsed?.choices?.[0]?.finish_reason,
             durationMs: durationMs(startedAt),
           });
-          if (!isResponsesApi) {
-            const headers = {
-              "Content-Type": result.upstreamRes.headers["content-type"] || "application/json; charset=utf-8",
-              "Cache-Control": result.upstreamRes.headers["cache-control"] || "no-cache",
-              Connection: "keep-alive",
-            };
+          const headers = {
+            "Content-Type": result.upstreamRes.headers["content-type"] || "application/json; charset=utf-8",
+            "Cache-Control": result.upstreamRes.headers["cache-control"] || "no-cache",
+            Connection: "keep-alive",
+          };
 
-            res.writeHead(result.upstreamRes.statusCode || 200, headers);
-            res.end(result.rawResponse);
-            return;
-          }
-
-          writeJson(res, result.upstreamRes.statusCode || 200, chatCompletionsToResponses(parsed));
+          res.writeHead(result.upstreamRes.statusCode || 200, headers);
+          res.end(result.rawResponse);
         } catch (error) {
           log("invalid-upstream-json", { requestId, error, bodyPreview: preview(result.text, 4000) });
           writeJson(res, 502, { error: "invalid upstream json" });
@@ -767,12 +508,9 @@ if (require.main === module) {
 
 module.exports = {
   CLIENT_MODELS,
-  chatCompletionsToResponses,
-  emitResponsesStreamFromChatStream,
   normalizeMaxTokens,
   normalizeModel,
   resolveModel,
-  responsesToChatCompletions,
   sanitizeBody,
   startServer,
 };

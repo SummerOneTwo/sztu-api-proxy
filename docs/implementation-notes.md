@@ -22,7 +22,7 @@ sztu-api-proxy/
     opencode-proxy.js    # OpenAI-compatible proxy for OpenCode
     opencode.json        # user-maintained reference config
   codebuddy/
-    codebuddy-proxy.js   # OpenAI/Responses-compatible proxy for CodeBuddy
+    codebuddy-proxy.js   # OpenAI-compatible proxy for CodeBuddy
     models.json          # user-maintained reference config
   docs/
 ```
@@ -184,7 +184,7 @@ codebuddy/codebuddy-proxy.js
 Purpose:
 
 ```text
-CodeBuddy -> local OpenAI/Responses-compatible proxy -> SZTU chat/completions
+CodeBuddy -> local OpenAI-compatible proxy -> SZTU chat/completions
 ```
 
 ### Client model ids (three tiers)
@@ -205,11 +205,9 @@ Internal alias: `deepseek-v4-pro-nothink` -> instruct.
 
 ### Compatibility work
 
-- Supports `/v1/chat/completions`.
-- Supports `/v1/responses` by converting Responses API-style input to chat
-  completions.
-- Preserves usage in streaming responses when SZTU sends usage.
-- Converts some OpenAI Responses-style output back when needed.
+- Supports `/v1/chat/completions` only (CodeBuddy custom models use this path).
+- Preserves usage in streaming responses when SZTU sends usage
+  (`stream_options.include_usage=true`).
 - Uses `any` in `models.json`; the proxy provides the real key upstream.
 - Strips client `reasoning` / `reasoning_effort` and re-injects kwargs by tier.
 

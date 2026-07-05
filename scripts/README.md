@@ -11,7 +11,7 @@ Suites:
 ```text
 direct      Calls SZTU upstream directly.
 opencode    Calls http://127.0.0.1:8788/v1/chat/completions.
-codebuddy   Calls http://127.0.0.1:8787/v1/chat/completions and /v1/responses.
+codebuddy   Calls http://127.0.0.1:8787/v1/chat/completions.
 all         Runs every suite.
 ```
 

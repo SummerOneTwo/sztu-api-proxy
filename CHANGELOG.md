@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Each change set is recorded under a new version immediately. There is no
 `[Unreleased]` section or separate release step.
 
+## [0.2.4] - 2026-07-05
+
+### Removed
+
+- Dropped `/v1/responses` from the CodeBuddy proxy; CodeBuddy custom models only
+  use `/v1/chat/completions`. Chat completions SSE streaming is unchanged.
+
 ## [0.2.3] - 2026-07-05
 
 ### Changed

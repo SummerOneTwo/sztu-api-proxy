@@ -31,7 +31,7 @@ sztu-api-proxy/
     opencode-proxy.js    # OpenAI-compatible proxy for OpenCode
     opencode.json        # user-maintained reference config
   codebuddy/
-    codebuddy-proxy.js   # OpenAI/Responses-compatible proxy for CodeBuddy
+    codebuddy-proxy.js   # OpenAI-compatible proxy for CodeBuddy
     models.json          # user-maintained reference config
   claudecode/            # removed in v0.2.2
   docs/
