@@ -3,8 +3,13 @@
 Local compatibility proxies for SZTU `glm-5.1` and `deepseek-v4-pro`.
 
 This repository only contains proxy code. Client configuration files such as
-OpenCode `opencode.json`, Claude Code `settings.json`, or CodeBuddy
-`model.json` can be copied into each subdirectory by the user.
+OpenCode `opencode.json` or CodeBuddy `model.json` can be copied into each
+subdirectory by the user.
+
+## Claude Code (No Longer Supported)
+
+The Claude Code proxy has been removed. This project no longer supports Claude Code.
+Use OpenCode or CodeBuddy instead.
 
 ## Environment
 
@@ -18,24 +23,12 @@ Optional:
 
 ```env
 SZTU_DEFAULT_MODEL=glm-5.1
-CLAUDE_SZTU_FALLBACK_MODEL=deepseek-v4-pro
 OPENCODE_PROXY_PORT=8788
-CLAUDE_SZTU_PROXY_PORT=8790
 CODEBUDDY_PROXY_PORT=8787
 SZTU_DEFAULT_MAX_TOKENS=32768
 SZTU_MAX_TOKENS=32768
 SZTU_THINKING_MIN_MAX_TOKENS=10000
-CLAUDE_SZTU_TOOL_MODE=native
-CLAUDE_SZTU_TOOL_HISTORY_MODE=text
 ```
-
-Existing installs should update `.env` as well as client settings. The proxy uses
-the process environment first, then `.env`; Claude Code `settings.json` model
-names do not override `SZTU_DEFAULT_MODEL`.
-
-Claude Code proxy (`claudecode/`) is currently optimized for GLM-first use with
-DeepSeek fallback; see
-`claudecode/README.md`.
 
 ## Proxies
 
@@ -43,12 +36,6 @@ OpenCode:
 
 ```powershell
 node .\opencode\opencode-proxy.js
-```
-
-Claude Code:
-
-```powershell
-node .\claudecode\claudecode-proxy.js
 ```
 
 CodeBuddy:
@@ -72,7 +59,6 @@ Run proxy checks after starting the matching proxy:
 ```powershell
 node .\scripts\test-api.js opencode
 node .\scripts\test-api.js codebuddy
-node .\scripts\test-api.js claudecode
 ```
 
 Run everything:

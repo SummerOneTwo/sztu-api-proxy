@@ -5,14 +5,22 @@ All notable changes to this project are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+Each change set is recorded under a new version immediately. There is no
+`[Unreleased]` section or separate release step.
+
+## [0.2.2] - 2026-07-05
+
+### Removed
+
+- Removed the Claude Code proxy (`claudecode/`), tool parser, and related tests. Claude Code is no longer supported; use OpenCode or CodeBuddy instead.
+
+## [0.2.1] - 2026-07-05
 
 ### Removed
 
 - Removed the Switchboard dashboard, CLI, process manager, and Windows autostart helper. Start each proxy directly with `node <proxy-dir>/<proxy>-proxy.js`.
 
 ## [0.2.0] - 2026-05-21
-
 ### Added
 
 - Added a local Switchboard dashboard and CLI for proxy control, service status, logs, environment configuration, and Windows autostart.
