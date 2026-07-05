@@ -35,7 +35,7 @@ OpenCode:
 node .\opencode\opencode-proxy.js
 ```
 
-Runtime logs and PID files are written under each proxy's `.runtime` folder.
+Runtime logs and PID files are under each proxy's `.runtime/` (`events/`, `payloads/`, `streams/`).
 
 ## Tests
 

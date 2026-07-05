@@ -2,22 +2,20 @@ const http = require("http");
 const fs = require("fs");
 const path = require("path");
 const { getApiKey, envNumber } = require("../shared/env");
-const { createLogger, durationMs, makeRequestId, summarizeBody } = require("../shared/logger");
+const { pidPath, streamPath: streamFilePath } = require("../shared/runtime-paths");
+const { createLogger, durationMs, makeRequestId, requestMeta } = require("../shared/logger");
 
 const HOST = "127.0.0.1";
 const PORT = envNumber("OPENCODE_PROXY_PORT", 8788);
 const UPSTREAM_HOST = "apiai.sztu.edu.cn";
 const UPSTREAM_PATH = "/v1/chat/completions";
-const CONFIG_DIR = __dirname;
-const RUNTIME_DIR = path.join(CONFIG_DIR, ".runtime");
-const LOG_PATH = path.join(RUNTIME_DIR, "opencode-proxy.log");
-const PID_PATH = path.join(RUNTIME_DIR, "opencode-proxy.pid");
+const SERVICE_DIR = __dirname;
+const RUNTIME_DIR = path.join(SERVICE_DIR, ".runtime");
+const PID_PATH = pidPath(SERVICE_DIR, "opencode-proxy");
 const DEFAULT_MAX_TOKENS = 8192;
 const MAX_TOKENS = 32768;
 
-fs.mkdirSync(RUNTIME_DIR, { recursive: true });
-
-const log = createLogger("opencode", LOG_PATH);
+const { log, logPayload, logRequestBodies, logStream } = createLogger("opencode", SERVICE_DIR);
 
 function readApiKey() {
   return getApiKey();
@@ -52,7 +50,8 @@ async function fetchWithRetry(url, options, requestId) {
         return response;
       }
       const text = await response.text().catch(() => "");
-      log("upstream-retryable-status", { requestId, attempt, status: response.status, body: text });
+      logPayload(requestId, `retry-${attempt}.txt`, text);
+      log("upstream-retryable-status", { requestId, attempt, status: response.status });
     } catch (error) {
       lastError = error;
       if (attempt === 3) {
@@ -199,12 +198,12 @@ function proxyRequest(req, res, body) {
 
   const upstreamBody = normalizeBody(body);
   const payload = JSON.stringify(upstreamBody);
+  logRequestBodies(requestId, body, upstreamBody);
   log("request", {
     requestId,
     method: req.method,
     url: req.url,
-    client: summarizeBody(body),
-    upstream: summarizeBody(upstreamBody),
+    ...requestMeta(upstreamBody),
     upstreamBytes: Buffer.byteLength(payload),
   });
 
@@ -228,11 +227,11 @@ function proxyRequest(req, res, body) {
 
       if (!upstreamRes.ok) {
         const text = await upstreamRes.text().catch(() => "");
+        logPayload(requestId, "error.txt", text);
         log("upstream-error-response", {
           requestId,
           status: upstreamRes.status,
           durationMs: durationMs(startedAt),
-          body: text,
         });
         writeJson(res, upstreamRes.status, {
           error: {
@@ -272,13 +271,32 @@ function proxyRequest(req, res, body) {
         responseBody += chunk.toString("utf8");
         res.write(chunk);
       }
-      log("response", {
-        requestId,
-        status: upstreamRes.status,
-        bytes,
-        durationMs: durationMs(startedAt),
-        body: responseBody,
-      });
+      if (upstreamBody.stream === true) {
+        logStream(requestId, responseBody);
+        log("stream-response", {
+          requestId,
+          status: upstreamRes.status,
+          bytes,
+          streamFile: path.relative(RUNTIME_DIR, streamFilePath(SERVICE_DIR, requestId)).replace(/\\/g, "/"),
+          durationMs: durationMs(startedAt),
+        });
+      } else {
+        let parsed;
+        try {
+          parsed = JSON.parse(responseBody);
+          logPayload(requestId, "response.json", parsed);
+        } catch {
+          logPayload(requestId, "response.txt", responseBody);
+        }
+        log("response", {
+          requestId,
+          status: upstreamRes.status,
+          bytes,
+          usage: parsed?.usage,
+          finishReason: parsed?.choices?.[0]?.finish_reason,
+          durationMs: durationMs(startedAt),
+        });
+      }
       res.end();
     })
     .catch((error) => {

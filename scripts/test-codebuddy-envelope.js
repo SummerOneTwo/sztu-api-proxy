@@ -11,7 +11,11 @@ const {
   sendEnvelopeRetryResponse,
 } = require("../codebuddy/codebuddy-proxy");
 
-const RUNTIME_DIR = path.join(__dirname, "../codebuddy/.runtime");
+const { fixturesDir } = require("../shared/runtime-paths");
+
+const CODEBUDDY_DIR = path.join(__dirname, "../codebuddy");
+const FIXTURES_DIR = fixturesDir(CODEBUDDY_DIR);
+const RUNTIME_DIR = path.join(CODEBUDDY_DIR, ".runtime");
 const PROXY_URL = `http://127.0.0.1:${process.env.CODEBUDDY_PROXY_PORT || 8787}`;
 
 function log(status, name, detail = "") {
@@ -61,8 +65,24 @@ function testHeaderOnlyEnvelope() {
 }
 
 function testTruncatedEnvelopeSalvage() {
-  const fixturePath = path.join(RUNTIME_DIR, "envelope-fail-cb_mquz401x_qhwduv.txt");
-  if (!fs.existsSync(fixturePath)) {
+  const names = [
+    "envelope-fail-cb_mquz401x_qhwduv.txt",
+    path.join("..", "envelope-fail-cb_mquz401x_qhwduv.txt"),
+  ];
+  let fixturePath = null;
+  for (const name of names) {
+    const candidate = path.join(FIXTURES_DIR, path.basename(name));
+    if (fs.existsSync(candidate)) {
+      fixturePath = candidate;
+      break;
+    }
+    const legacy = path.join(RUNTIME_DIR, path.basename(name));
+    if (fs.existsSync(legacy)) {
+      fixturePath = legacy;
+      break;
+    }
+  }
+  if (!fixturePath) {
     log("SKIP", "truncated envelope salvage", "fixture missing");
     return;
   }

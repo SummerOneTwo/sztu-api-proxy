@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Each change set is recorded under a new version immediately. There is no
 `[Unreleased]` section or separate release step.
 
+## [0.2.7] - 2026-07-05
+
+### Changed
+
+- Split proxy logs into `events/` (compact JSONL timeline), `payloads/` (full
+  request/response bodies), and `streams/` (full SSE). Async writes and 3-day
+  directory retention replace single-file prune.
+- Added [`shared/runtime-paths.js`](shared/runtime-paths.js) for consistent
+  `.runtime` layout under each proxy directory.
+
 ## [0.2.6] - 2026-07-05
 
 ### Fixed

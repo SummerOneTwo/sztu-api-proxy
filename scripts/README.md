@@ -37,10 +37,13 @@ node .\scripts\test-codebuddy-proxy.js
 node .\scripts\test-codebuddy-envelope.js
 ```
 
-When a proxy test fails, check the JSONL runtime logs and search by
-`requestId`:
+When a proxy test fails, search events by `requestId`, then open sidecar files:
 
 ```powershell
-Get-Content -Tail 30 .\codebuddy\.runtime\codebuddy-proxy.log
-Get-Content -Tail 30 .\opencode\.runtime\opencode-proxy.log
+Get-Content -Tail 30 .\codebuddy\.runtime\events\*.jsonl
+Get-Content .\codebuddy\.runtime\payloads\cb_REQUEST_ID\sanitized.json
+Get-Content .\codebuddy\.runtime\streams\cb_REQUEST_ID.sse
+Get-Content -Tail 30 .\opencode\.runtime\events\*.jsonl
 ```
+
+Envelope salvage fixture (optional): `codebuddy/.runtime/fixtures/envelope-fail-*.txt`

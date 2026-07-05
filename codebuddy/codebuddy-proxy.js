@@ -3,14 +3,15 @@ const https = require("https");
 const fs = require("fs");
 const path = require("path");
 const { getApiKey, envNumber } = require("../shared/env");
-const { createLogger, durationMs, makeRequestId, summarizeBody } = require("../shared/logger");
+const { pidPath, streamPath: streamFilePath } = require("../shared/runtime-paths");
+const { createLogger, durationMs, makeRequestId, requestMeta } = require("../shared/logger");
 
 const PORT = envNumber("CODEBUDDY_PROXY_PORT", envNumber("PORT", 8787));
 const TARGET_HOST = "apiai.sztu.edu.cn";
 const TARGET_PATH = "/v1/chat/completions";
-const LOG_DIR = path.join(__dirname, ".runtime");
-const LOG_PATH = path.join(LOG_DIR, "codebuddy-proxy.log");
-const PID_PATH = path.join(LOG_DIR, "codebuddy-proxy.pid");
+const SERVICE_DIR = __dirname;
+const RUNTIME_DIR = path.join(SERVICE_DIR, ".runtime");
+const PID_PATH = pidPath(SERVICE_DIR, "codebuddy-proxy");
 const SZTU_DEFAULT_MAX_TOKENS = 8192;
 const SZTU_MAX_TOKENS = 32768;
 const DSV4_API_MODEL = "deepseek-v4-pro";
@@ -23,17 +24,7 @@ const CLIENT_MODELS = [
 
 const CODEBUDDY_ENVELOPE_STUB = String(process.env.CODEBUDDY_ENVELOPE_STUB || "0").trim() === "1";
 
-fs.mkdirSync(LOG_DIR, { recursive: true });
-
-const log = createLogger("codebuddy", LOG_PATH);
-
-function preview(value, maxLen = 1000) {
-  const text = typeof value === "string" ? value : JSON.stringify(value);
-  if (text.length <= maxLen) {
-    return text;
-  }
-  return `${text.slice(0, maxLen)}…`;
-}
+const { log, logPayload, logRequestBodies, logStream } = createLogger("codebuddy", SERVICE_DIR);
 
 function cleanupAndExit(signal) {
   log("shutdown", { signal });
@@ -238,11 +229,12 @@ function forwardChatCompletionStream(res, upstreamRes, requestId, startedAt) {
     body += chunk.toString("utf8");
   });
   upstreamRes.on("end", () => {
+    logStream(requestId, body);
     log("stream-response", {
       requestId,
       status: upstreamRes.statusCode,
       bytes,
-      body,
+      streamFile: path.relative(RUNTIME_DIR, streamFilePath(SERVICE_DIR, requestId)).replace(/\\/g, "/"),
       durationMs: durationMs(startedAt),
     });
   });
@@ -307,11 +299,11 @@ async function requestUpstreamWithRetry(payload, apiKey, wantsStream, requestId,
     try {
       const result = await requestUpstreamOnce(payload, apiKey, wantsStream, requestId, startedAt);
       if (result.retryable && attempt < 3) {
+        logPayload(requestId, `retry-${attempt}.txt`, result.text);
         log("upstream-retryable-status", {
           requestId,
           attempt,
           status: result.upstreamRes.statusCode,
-          body: result.text,
         });
         await delay(500 * attempt);
         continue;
@@ -782,10 +774,10 @@ function parseClientBody(raw, requestId, headers = {}) {
     const error = new Error("http_envelope_without_json_body");
     error.envelopeReason = salvageReason;
     error.envelopeMetrics = envelopeMetrics;
+    logPayload(requestId, "raw-envelope.txt", raw);
     log("invalid-json", {
       requestId,
       error,
-      bodyPreview: preview(raw, 1000),
       bodyBytes: envelopeMetrics.totalBytes,
       declaredContentLength: envelopeMetrics.declaredContentLength,
       actualBodyBytes: envelopeMetrics.actualBodyBytes,
@@ -955,6 +947,13 @@ const server = http.createServer((req, res) => {
         envelope
         && (error instanceof SyntaxError || error?.message === "http_envelope_without_json_body")
       ) {
+        logPayload(requestId, "raw-envelope.txt", raw);
+        log("invalid-json", {
+          requestId,
+          error,
+          envelope: true,
+          reason: error?.envelopeReason || "missing_json_body",
+        });
         if (CODEBUDDY_ENVELOPE_STUB) {
           sendCodebuddyEnvelopeStub(res, requestId, startedAt);
         } else {
@@ -969,7 +968,8 @@ const server = http.createServer((req, res) => {
         return;
       }
       if (error instanceof SyntaxError) {
-        log("invalid-json", { requestId, error, bodyPreview: preview(raw, 1000) });
+        logPayload(requestId, "raw-body.txt", raw);
+        log("invalid-json", { requestId, error });
         writeJson(res, 400, { error: "invalid json" });
         return;
       }
@@ -977,7 +977,8 @@ const server = http.createServer((req, res) => {
         writeJson(res, 400, { error: "malformed http envelope" });
         return;
       }
-      log("invalid-json", { requestId, error, bodyPreview: preview(raw, 1000) });
+      logPayload(requestId, "raw-body.txt", raw);
+      log("invalid-json", { requestId, error });
       writeJson(res, 400, { error: "invalid json" });
       return;
     }
@@ -1002,13 +1003,15 @@ const server = http.createServer((req, res) => {
       return;
     }
     const payload = JSON.stringify(upstreamBody);
+    const clientResolved = resolveModel(body?.model);
+    logRequestBodies(requestId, body, nextBody);
     log("request", {
       requestId,
       method: req.method,
       url: req.url,
-      client: summarizeBody(body),
-      sanitized: summarizeBody(nextBody),
-      upstream: summarizeBody(upstreamBody),
+      clientModel: clientResolved?.clientModel,
+      tier: clientResolved?.tier,
+      ...requestMeta(nextBody),
       upstreamBytes: Buffer.byteLength(payload),
     });
 
@@ -1021,10 +1024,10 @@ const server = http.createServer((req, res) => {
 
         if (result.type === "error") {
           const status = result.upstreamRes.statusCode || 502;
+          logPayload(requestId, "error.txt", result.text);
           log("upstream-error-response", {
             requestId,
             status,
-            body: result.text,
             durationMs: durationMs(startedAt),
           });
           res.writeHead(status, {
@@ -1036,11 +1039,13 @@ const server = http.createServer((req, res) => {
 
         try {
           const parsed = JSON.parse(result.text);
+          logPayload(requestId, "response.json", parsed);
           log("response", {
             requestId,
             status: result.upstreamRes.statusCode,
             bytes: result.rawResponse.length,
-            body: parsed,
+            usage: parsed?.usage,
+            finishReason: parsed?.choices?.[0]?.finish_reason,
             durationMs: durationMs(startedAt),
           });
           const headers = {
@@ -1052,7 +1057,8 @@ const server = http.createServer((req, res) => {
           res.writeHead(result.upstreamRes.statusCode || 200, headers);
           res.end(result.rawResponse);
         } catch (error) {
-          log("invalid-upstream-json", { requestId, error, body: result.text });
+          logPayload(requestId, "invalid-upstream.txt", result.text);
+          log("invalid-upstream-json", { requestId, error });
           writeJson(res, 502, { error: "invalid upstream json" });
         }
       })

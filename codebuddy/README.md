@@ -41,7 +41,7 @@ Invoke-RestMethod http://127.0.0.1:8787/health
 - `deepseek-v4-pro-max` raises `max_tokens` to at least 4000 per official Think Max guidance.
 - Upstream 5xx errors retry up to 3 times.
 - Tool history: assistant `tool_calls` dropped; `role: tool` converted to user text.
-- JSONL logs under `.runtime/`; entries older than 7 days are pruned automatically.
+- Logs under `.runtime/events/` (timeline) plus `.runtime/payloads/` and `.runtime/streams/` (full bodies); 3-day retention.
 
 ## CodeBuddy HTTP envelope handling
 

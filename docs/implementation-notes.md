@@ -164,7 +164,9 @@ the real key from `.env`.
 Runtime logs:
 
 ```text
-opencode/.runtime/opencode-proxy.log
+opencode/.runtime/events/YYYY-MM-DD.jsonl
+opencode/.runtime/payloads/{requestId}/
+opencode/.runtime/streams/{requestId}.sse
 ```
 
 ## CodeBuddy Proxy
@@ -221,7 +223,10 @@ DeepSeek SSE usage was testable through the CodeBuddy proxy path.
 Runtime logs:
 
 ```text
-codebuddy/.runtime/codebuddy-proxy.log
+codebuddy/.runtime/events/YYYY-MM-DD.jsonl
+codebuddy/.runtime/payloads/{requestId}/
+codebuddy/.runtime/streams/{requestId}.sse
+codebuddy/.runtime/fixtures/   # optional envelope debug fixtures
 ```
 
 ### HTTP envelope (CodeBuddy CLI)
@@ -285,34 +290,43 @@ The repository ignores:
 
 ## Runtime Logs
 
-The proxy logs are kept under each proxy's ignored `.runtime` directory:
+Each proxy writes under its own ignored `.runtime` directory:
 
 ```text
-opencode/.runtime/opencode-proxy.log
-codebuddy/.runtime/codebuddy-proxy.log
+codebuddy/.runtime/
+  codebuddy-proxy.pid
+  events/YYYY-MM-DD.jsonl       # compact timeline (grep here first)
+  payloads/{requestId}/         # full bodies (sanitized.json, client.json, response.json, error.txt, ...)
+  streams/{requestId}.sse       # full SSE for streaming responses
+  fixtures/                     # optional envelope debug fixtures
+
+opencode/.runtime/
+  opencode-proxy.pid
+  events/YYYY-MM-DD.jsonl
+  payloads/{requestId}/
+  streams/{requestId}.sse
 ```
 
-The logs use JSON Lines. Each line is one event and includes:
+Each events line is JSON with:
 
 ```text
-ts          ISO timestamp
-service     opencode / codebuddy
-event       request, upstream-response-start, response, upstream-error-response, ...
-requestId   stable id for one client request
-durationMs  elapsed time for upstream/response events
+ts, service, event, requestId, durationMs
+plus tuning fields: model, tier, max_tokens, messages, tools, usage, ...
 ```
+
+Full request/response bodies live in sidecar files, not inline in events.
 
 Useful debugging flow:
 
 ```powershell
-rg '"event":"upstream-error-response"' .\**\.runtime\*.log
-rg "cb_..." .\codebuddy\.runtime\codebuddy-proxy.log
+rg '"event":"request"' .\codebuddy\.runtime\events\
+rg "cb_abc123" .\codebuddy\.runtime\events\
+Get-Content .\codebuddy\.runtime\payloads\cb_abc123\sanitized.json
+Get-Content .\codebuddy\.runtime\streams\cb_abc123.sse
 ```
 
-For every proxied request, the logs record full client, sanitized, and upstream
-bodies, plus full response bodies (JSON or SSE text).
-
-Retention: entries older than **7 days** are pruned on proxy startup and hourly.
+Retention: events, payloads, and streams older than **3 days** are deleted on
+startup and hourly.
 
 Common failure modes:
 
