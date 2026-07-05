@@ -32,12 +32,7 @@ function loadDotEnv(filePath = ENV_PATH) {
 
 function getApiKey() {
   loadDotEnv();
-  const value =
-    process.env.SZTU_API_KEY ||
-    process.env.GLM_API_KEY ||
-    process.env.OPENAI_API_KEY ||
-    process.env.ANTHROPIC_API_KEY ||
-    process.env.ANTHROPIC_AUTH_TOKEN;
+  const value = process.env.SZTU_API_KEY;
   if (value && value.trim() && value.trim() !== "any") {
     return value.trim();
   }

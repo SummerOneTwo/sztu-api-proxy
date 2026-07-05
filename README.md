@@ -6,8 +6,6 @@ Official API reference: [docs/DeepSeek-V4-Pro_API_v1.0.md](docs/DeepSeek-V4-Pro_
 
 Trial notes: [docs/implementation-notes.md](docs/implementation-notes.md)
 
-Historical GLM / Claude Code: [docs/archived.md](docs/archived.md)
-
 ## Environment
 
 Create `.env` in the repository root:
@@ -16,14 +14,11 @@ Create `.env` in the repository root:
 SZTU_API_KEY=your_key_here
 ```
 
-Optional:
+Optional ports:
 
 ```env
-SZTU_DEFAULT_MODEL=deepseek-v4-pro
-OPENCODE_PROXY_PORT=8788
 CODEBUDDY_PROXY_PORT=8787
-SZTU_DEFAULT_MAX_TOKENS=8192
-SZTU_MAX_TOKENS=32768
+OPENCODE_PROXY_PORT=8788
 ```
 
 ## Proxies

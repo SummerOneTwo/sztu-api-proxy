@@ -2,7 +2,7 @@ const http = require("http");
 const fs = require("fs");
 const path = require("path");
 const { getApiKey, envNumber } = require("../shared/env");
-const { createLogger, durationMs, makeRequestId, preview, summarizeBody } = require("../shared/logger");
+const { createLogger, durationMs, makeRequestId, summarizeBody } = require("../shared/logger");
 
 const HOST = "127.0.0.1";
 const PORT = envNumber("OPENCODE_PROXY_PORT", 8788);
@@ -12,8 +12,8 @@ const CONFIG_DIR = __dirname;
 const RUNTIME_DIR = path.join(CONFIG_DIR, ".runtime");
 const LOG_PATH = path.join(RUNTIME_DIR, "opencode-proxy.log");
 const PID_PATH = path.join(RUNTIME_DIR, "opencode-proxy.pid");
-const DEFAULT_MAX_TOKENS = envNumber("SZTU_DEFAULT_MAX_TOKENS", 16384);
-const MAX_TOKENS = envNumber("SZTU_MAX_TOKENS", 32768);
+const DEFAULT_MAX_TOKENS = 8192;
+const MAX_TOKENS = 32768;
 
 fs.mkdirSync(RUNTIME_DIR, { recursive: true });
 
@@ -52,7 +52,7 @@ async function fetchWithRetry(url, options, requestId) {
         return response;
       }
       const text = await response.text().catch(() => "");
-      log("upstream-retryable-status", { requestId, attempt, status: response.status, bodyPreview: preview(text, 1000) });
+      log("upstream-retryable-status", { requestId, attempt, status: response.status, body: text });
     } catch (error) {
       lastError = error;
       if (attempt === 3) {
@@ -68,9 +68,9 @@ async function fetchWithRetry(url, options, requestId) {
 function normalizeMaxTokens(value) {
   const number = Number(value);
   if (!Number.isFinite(number) || number <= 0) {
-    return Math.min(DEFAULT_MAX_TOKENS, MAX_TOKENS);
+    return DEFAULT_MAX_TOKENS;
   }
-  return Math.min(Math.trunc(number), DEFAULT_MAX_TOKENS, MAX_TOKENS);
+  return Math.min(Math.trunc(number), MAX_TOKENS);
 }
 
 function flattenContent(content) {
@@ -133,11 +133,9 @@ function normalizeMessage(message) {
 
 function normalizeBody(body) {
   const maxTokens = normalizeMaxTokens(body.max_tokens ?? body.max_completion_tokens ?? body.max_output_tokens);
-  const requestedModel = typeof body.model === "string" ? body.model.split("/").pop() : "";
-  const model = requestedModel === "deepseek-v4-pro" ? "deepseek-v4-pro" : "glm-5.1";
   const next = {
     ...body,
-    model,
+    model: "deepseek-v4-pro",
   };
 
   if (Array.isArray(body.messages)) {
@@ -149,17 +147,10 @@ function normalizeBody(body) {
   }
 
   const template = body.chat_template_kwargs && typeof body.chat_template_kwargs === "object" ? body.chat_template_kwargs : {};
-  if (model === "deepseek-v4-pro") {
-    next.chat_template_kwargs = {
-      thinking: false,
-      ...template,
-    };
-  } else {
-    next.chat_template_kwargs = {
-      enable_thinking: false,
-      ...template,
-    };
-  }
+  next.chat_template_kwargs = {
+    thinking: false,
+    ...template,
+  };
 
   if (next.stream === true) {
     next.stream_options = {
@@ -194,40 +185,6 @@ function writeJson(res, status, payload) {
     "Content-Length": Buffer.byteLength(text),
   });
   res.end(text);
-}
-
-function transformSseEvent(eventText, upstreamModel) {
-  const lines = eventText.split(/\r?\n/);
-  return lines
-    .map((line) => {
-      if (!line.startsWith("data:")) {
-        return line;
-      }
-
-      const prefixMatch = line.match(/^data:\s*/);
-      const prefix = prefixMatch ? prefixMatch[0] : "data: ";
-      const dataText = line.slice(prefix.length);
-      if (dataText === "[DONE]") {
-        return line;
-      }
-
-      try {
-        const payload = JSON.parse(dataText);
-        if (upstreamModel === "glm-5.1") {
-          for (const choice of payload.choices || []) {
-            const delta = choice.delta;
-            if (delta && typeof delta.reasoning === "string" && delta.reasoning_content === undefined) {
-              delta.reasoning_content = delta.reasoning;
-              delete delta.reasoning;
-            }
-          }
-        }
-        return `${prefix}${JSON.stringify(payload)}`;
-      } catch {
-        return line;
-      }
-    })
-    .join("\n");
 }
 
 function proxyRequest(req, res, body) {
@@ -275,7 +232,7 @@ function proxyRequest(req, res, body) {
           requestId,
           status: upstreamRes.status,
           durationMs: durationMs(startedAt),
-          bodyPreview: preview(text, 1000),
+          body: text,
         });
         writeJson(res, upstreamRes.status, {
           error: {
@@ -304,7 +261,7 @@ function proxyRequest(req, res, body) {
 
       const reader = upstreamRes.body.getReader();
       let bytes = 0;
-      let sseBuffer = "";
+      let responseBody = "";
       while (true) {
         const { done, value } = await reader.read();
         if (done) {
@@ -312,26 +269,15 @@ function proxyRequest(req, res, body) {
         }
         const chunk = Buffer.from(value);
         bytes += chunk.length;
-        if (upstreamBody.stream === true && upstreamBody.model === "glm-5.1") {
-          sseBuffer += chunk.toString("utf8");
-          const events = sseBuffer.split(/\r?\n\r?\n/);
-          sseBuffer = events.pop() || "";
-          for (const eventText of events) {
-            res.write(`${transformSseEvent(eventText, upstreamBody.model)}\n\n`);
-          }
-        } else {
-          res.write(chunk);
-        }
-      }
-      if (sseBuffer) {
-        res.write(transformSseEvent(sseBuffer, upstreamBody.model));
+        responseBody += chunk.toString("utf8");
+        res.write(chunk);
       }
       log("response", {
         requestId,
         status: upstreamRes.status,
         bytes,
         durationMs: durationMs(startedAt),
-        errorPreview: upstreamRes.status >= 400 ? preview(sseBuffer, 1000) : undefined,
+        body: responseBody,
       });
       res.end();
     })
@@ -348,7 +294,7 @@ function proxyRequest(req, res, body) {
 const server = http.createServer(async (req, res) => {
   try {
     if (req.method === "GET" && req.url === "/health") {
-      writeJson(res, 200, { ok: true, models: ["glm-5.1", "deepseek-v4-pro"] });
+      writeJson(res, 200, { ok: true, models: ["deepseek-v4-pro"] });
       return;
     }
 
@@ -356,7 +302,6 @@ const server = http.createServer(async (req, res) => {
       writeJson(res, 200, {
         object: "list",
         data: [
-          { id: "glm-5.1", object: "model", created: 0, owned_by: "sztu" },
           { id: "deepseek-v4-pro", object: "model", created: 0, owned_by: "sztu" },
         ],
       });

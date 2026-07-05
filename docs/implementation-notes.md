@@ -5,9 +5,6 @@ through the OpenCode and CodeBuddy local proxies.
 
 Official API reference: [DeepSeek-V4-Pro_API_v1.0.md](DeepSeek-V4-Pro_API_v1.0.md)
 
-Historical GLM / Claude Code notes: [archived.md](archived.md) (not used for
-current CodeBuddy setup).
-
 Keep secrets out of this file. Real keys should only live in the repository root
 `.env`.
 
@@ -85,11 +82,11 @@ max_tokens=32768    OK
 max_tokens=65536    400: max_tokens exceeds limit of 32768
 ```
 
-The CodeBuddy proxy uses env-configurable defaults:
+The CodeBuddy proxy uses hardcoded defaults:
 
 ```text
-SZTU_DEFAULT_MAX_TOKENS=8192   # when the client omits max_tokens
-SZTU_MAX_TOKENS=32768          # cap for explicit client requests
+default max_tokens = 8192   # when the client omits max_tokens
+max max_tokens     = 32768  # cap for explicit client requests
 ```
 
 For `deepseek-v4-pro-max`, the proxy floors `max_tokens` to 4000 when the
@@ -128,8 +125,6 @@ The CodeBuddy proxy workaround:
 
 Verified through the CodeBuddy proxy path:
 
-- GLM native tool call (historical; GLM no longer used)
-- GLM tool-result follow-up (historical)
 - DeepSeek non-stream chat
 - CodeBuddy CLI end-to-end against DeepSeek models
 
@@ -149,8 +144,7 @@ OpenCode -> local OpenAI-compatible proxy -> SZTU chat/completions
 
 Important compatibility work:
 
-- Normalize model names to `deepseek-v4-pro` (and legacy `glm-5.1` if still
-  configured in `opencode.json`).
+- Normalize model names to `deepseek-v4-pro`.
 - Add `stream_options.include_usage=true` for streaming requests.
 - Clamp `max_tokens`.
 - Remove unsupported request fields such as provider metadata and top-level
@@ -284,15 +278,10 @@ rg '"event":"upstream-error-response"' .\**\.runtime\*.log
 rg "cb_..." .\codebuddy\.runtime\codebuddy-proxy.log
 ```
 
-For every proxied request, the logs record sanitized summaries for both client
-and upstream bodies:
+For every proxied request, the logs record full client, sanitized, and upstream
+bodies, plus full response bodies (JSON or SSE text).
 
-```text
-model, stream, max_tokens, message count, role list, content size,
-last user preview, tool count, tool names, stream options, thinking flags
-```
-
-They intentionally do not log real API keys or Authorization headers.
+Retention: entries older than **7 days** are pruned on proxy startup and hourly.
 
 Common failure modes:
 

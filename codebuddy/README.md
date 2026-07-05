@@ -37,11 +37,11 @@ Invoke-RestMethod http://127.0.0.1:8787/health
 ## Notes
 
 - Pick reasoning tier by **model id** in CodeBuddy (no per-model effort field in `models.json`).
-- `max_completion_tokens` / `max_output_tokens` normalize to `max_tokens`.
-- Missing `max_tokens` defaults to `SZTU_DEFAULT_MAX_TOKENS` (8192); cap at `SZTU_MAX_TOKENS`.
+- Missing `max_tokens` defaults to **8192**; cap at **32768** (hardcoded in proxy).
 - `deepseek-v4-pro-max` raises `max_tokens` to at least 4000 per official Think Max guidance.
 - Upstream 5xx errors retry up to 3 times.
 - Tool history: assistant `tool_calls` dropped; `role: tool` converted to user text.
+- JSONL logs under `.runtime/`; entries older than 7 days are pruned automatically.
 
 ## Tests
 

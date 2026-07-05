@@ -3,11 +3,11 @@ const { getApiKey, envNumber, loadDotEnv } = require("../shared/env");
 
 loadDotEnv();
 
-const UPSTREAM_URL = process.env.SZTU_UPSTREAM_URL || "https://apiai.sztu.edu.cn/v1/chat/completions";
+const UPSTREAM_URL = "https://apiai.sztu.edu.cn/v1/chat/completions";
 const OPENCODE_URL = `http://127.0.0.1:${envNumber("OPENCODE_PROXY_PORT", 8788)}/v1/chat/completions`;
 const CODEBUDDY_CHAT_URL = `http://127.0.0.1:${envNumber("CODEBUDDY_PROXY_PORT", envNumber("PORT", 8787))}/v1/chat/completions`;
 
-const DEFAULT_TIMEOUT_MS = envNumber("TEST_TIMEOUT_MS", 120000);
+const DEFAULT_TIMEOUT_MS = 120000;
 
 function usage() {
   console.log(`Usage: node scripts/test-api.js [suite...]
@@ -159,7 +159,7 @@ function upstreamHeaders() {
 async function openAiNonStream(name, url, model, expectedText, headers = {}) {
   return testCase(name, async () => {
     const res = await postJson(url, chatBody(model, `请只回复 ${expectedText}`, {
-      chat_template_kwargs: model === "deepseek-v4-pro" ? { thinking: false } : { enable_thinking: false },
+      chat_template_kwargs: { thinking: false },
     }), headers);
     assertOk(res.status === 200, `status=${res.status} body=${res.text.slice(0, 300)}`);
     const json = parseJson(res.text);
@@ -178,7 +178,7 @@ async function openAiStream(name, url, model, expectedText, headers = {}) {
     const body = chatBody(model, `请只回复 ${expectedText}`, {
       stream: true,
       stream_options: { include_usage: true },
-      chat_template_kwargs: model === "deepseek-v4-pro" ? { thinking: false } : { enable_thinking: false },
+      chat_template_kwargs: { thinking: false },
     });
     const res = await postJson(url, body, headers);
     assertOk(res.status === 200, `status=${res.status} body=${res.text.slice(0, 300)}`);
@@ -193,8 +193,6 @@ async function openAiStream(name, url, model, expectedText, headers = {}) {
 async function testDirect() {
   const headers = upstreamHeaders();
   const ok = [];
-  ok.push(await openAiNonStream("direct glm non-stream", UPSTREAM_URL, "glm-5.1", "GLM_OK", headers));
-  ok.push(await openAiStream("direct glm stream usage", UPSTREAM_URL, "glm-5.1", "GLM_STREAM_OK", headers));
   ok.push(await openAiNonStream("direct deepseek non-stream", UPSTREAM_URL, "deepseek-v4-pro", "DS_OK", headers));
   ok.push(await openAiStream("direct deepseek stream usage", UPSTREAM_URL, "deepseek-v4-pro", "DS_STREAM_OK", headers));
   return ok;
@@ -202,8 +200,6 @@ async function testDirect() {
 
 async function testOpenCode() {
   const ok = [];
-  ok.push(await openAiNonStream("opencode proxy glm non-stream", OPENCODE_URL, "glm-5.1", "GLM_OK"));
-  ok.push(await openAiStream("opencode proxy glm stream usage", OPENCODE_URL, "glm-5.1", "GLM_STREAM_OK"));
   ok.push(await openAiNonStream("opencode proxy deepseek non-stream", OPENCODE_URL, "deepseek-v4-pro", "DS_OK"));
   ok.push(await openAiStream("opencode proxy deepseek stream usage", OPENCODE_URL, "deepseek-v4-pro", "DS_STREAM_OK"));
   return ok;

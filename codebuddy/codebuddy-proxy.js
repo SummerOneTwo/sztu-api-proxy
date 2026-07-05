@@ -3,7 +3,7 @@ const https = require("https");
 const fs = require("fs");
 const path = require("path");
 const { getApiKey, envNumber } = require("../shared/env");
-const { createLogger, durationMs, makeRequestId, preview, summarizeBody: summarizeSharedBody } = require("../shared/logger");
+const { createLogger, durationMs, makeRequestId, summarizeBody } = require("../shared/logger");
 
 const PORT = envNumber("CODEBUDDY_PROXY_PORT", envNumber("PORT", 8787));
 const TARGET_HOST = "apiai.sztu.edu.cn";
@@ -11,8 +11,8 @@ const TARGET_PATH = "/v1/chat/completions";
 const LOG_DIR = path.join(__dirname, ".runtime");
 const LOG_PATH = path.join(LOG_DIR, "codebuddy-proxy.log");
 const PID_PATH = path.join(LOG_DIR, "codebuddy-proxy.pid");
-const SZTU_DEFAULT_MAX_TOKENS = envNumber("SZTU_DEFAULT_MAX_TOKENS", 8192);
-const SZTU_MAX_TOKENS = envNumber("SZTU_MAX_TOKENS", 32768);
+const SZTU_DEFAULT_MAX_TOKENS = 8192;
+const SZTU_MAX_TOKENS = 32768;
 const DSV4_API_MODEL = "deepseek-v4-pro";
 const DSV4_MAX_TIER_FLOOR = 4000;
 const CLIENT_MODELS = [
@@ -114,12 +114,7 @@ function sanitizeBody(body) {
   }
   next.model = resolved.apiModel;
 
-  next.max_tokens = normalizeMaxTokens(
-    next.max_tokens ?? next.max_completion_tokens ?? next.max_output_tokens,
-    resolved.tier
-  );
-  delete next.max_completion_tokens;
-  delete next.max_output_tokens;
+  next.max_tokens = normalizeMaxTokens(next.max_tokens, resolved.tier);
 
   // Keep unsupported request knobs out, but preserve the OpenAI tool-calling
   // fields CodeBuddy needs to execute tools across turns.
@@ -220,25 +215,6 @@ function flattenContent(content) {
     .join("\n");
 }
 
-function summarizeCodebuddyBody(body) {
-  const messages = Array.isArray(body?.messages) ? body.messages : [];
-  const contentChars = messages.reduce((sum, message) => {
-    const content = typeof message?.content === "string" ? message.content : flattenContent(message?.content);
-    return sum + content.length;
-  }, 0);
-
-  return {
-    model: body?.model,
-    stream: body?.stream === true,
-    messages: messages.length || undefined,
-    content_chars: contentChars || undefined,
-    tools: Array.isArray(body?.tools) ? body.tools.length : undefined,
-    tool_choice: body?.tool_choice,
-    max_tokens: body?.max_tokens,
-    max_completion_tokens: body?.max_completion_tokens,
-  };
-}
-
 function forwardChatCompletionStream(res, upstreamRes, requestId, startedAt) {
   res.writeHead(upstreamRes.statusCode || 200, {
     "Content-Type": "text/event-stream; charset=utf-8",
@@ -246,14 +222,17 @@ function forwardChatCompletionStream(res, upstreamRes, requestId, startedAt) {
     Connection: "keep-alive",
   });
   let bytes = 0;
+  let body = "";
   upstreamRes.on("data", (chunk) => {
     bytes += chunk.length;
+    body += chunk.toString("utf8");
   });
   upstreamRes.on("end", () => {
     log("stream-response", {
       requestId,
       status: upstreamRes.statusCode,
       bytes,
+      body,
       durationMs: durationMs(startedAt),
     });
   });
@@ -322,7 +301,7 @@ async function requestUpstreamWithRetry(payload, apiKey, wantsStream, requestId,
           requestId,
           attempt,
           status: result.upstreamRes.statusCode,
-          bodyPreview: preview(result.text, 1000),
+          body: result.text,
         });
         await delay(500 * attempt);
         continue;
@@ -387,7 +366,7 @@ const server = http.createServer((req, res) => {
     try {
       body = JSON.parse(raw);
     } catch (error) {
-      log("invalid-json", { requestId, error, bodyPreview: preview(raw, 1000) });
+      log("invalid-json", { requestId, error, body: raw });
       writeJson(res, 400, { error: "invalid json" });
       return;
     }
@@ -416,9 +395,9 @@ const server = http.createServer((req, res) => {
       requestId,
       method: req.method,
       url: req.url,
-      client: summarizeSharedBody(body),
-      sanitized: summarizeCodebuddyBody(nextBody),
-      upstream: summarizeSharedBody(upstreamBody),
+      client: summarizeBody(body),
+      sanitized: summarizeBody(nextBody),
+      upstream: summarizeBody(upstreamBody),
       upstreamBytes: Buffer.byteLength(payload),
     });
 
@@ -434,7 +413,7 @@ const server = http.createServer((req, res) => {
           log("upstream-error-response", {
             requestId,
             status,
-            bodyPreview: preview(result.text, 2000),
+            body: result.text,
             durationMs: durationMs(startedAt),
           });
           res.writeHead(status, {
@@ -450,9 +429,7 @@ const server = http.createServer((req, res) => {
             requestId,
             status: result.upstreamRes.statusCode,
             bytes: result.rawResponse.length,
-            usage: parsed?.usage,
-            choices: Array.isArray(parsed?.choices) ? parsed.choices.length : undefined,
-            finishReason: parsed?.choices?.[0]?.finish_reason,
+            body: parsed,
             durationMs: durationMs(startedAt),
           });
           const headers = {
@@ -464,7 +441,7 @@ const server = http.createServer((req, res) => {
           res.writeHead(result.upstreamRes.statusCode || 200, headers);
           res.end(result.rawResponse);
         } catch (error) {
-          log("invalid-upstream-json", { requestId, error, bodyPreview: preview(result.text, 4000) });
+          log("invalid-upstream-json", { requestId, error, body: result.text });
           writeJson(res, 502, { error: "invalid upstream json" });
         }
       })

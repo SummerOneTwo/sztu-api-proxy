@@ -8,6 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Each change set is recorded under a new version immediately. There is no
 `[Unreleased]` section or separate release step.
 
+## [0.2.5] - 2026-07-05
+
+### Changed
+
+- Proxy JSONL logs now retain full request/response bodies (no redaction or
+  truncation).
+- `.env` needs `SZTU_API_KEY`; optional `CODEBUDDY_PROXY_PORT` / `OPENCODE_PROXY_PORT`.
+  Other proxy policy is hardcoded.
+- `docs/archived.md` and GLM API docs removed; OpenCode proxy is DeepSeek-only.
+
+### Removed
+
+- GLM model routing, SSE transforms, and `opencode.json` GLM config.
+
 ## [0.2.4] - 2026-07-05
 
 ### Removed
@@ -33,7 +47,7 @@ Each change set is recorded under a new version immediately. There is no
 
 ### Added
 
-- `docs/archived.md` for GLM / Claude Code trial notes only.
+- `docs/archived.md` for historical trial notes.
 - `scripts/test-codebuddy-proxy.js` unit tests for model tiers and sanitization.
 
 ### Removed

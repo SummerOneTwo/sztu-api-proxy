@@ -23,7 +23,7 @@ function testResolveModel() {
 
   assert.strictEqual(resolveModel("deepseek-v4-pro-nothink").tier, "instruct");
   assert.strictEqual(resolveModel(null), null);
-  assert.strictEqual(resolveModel("glm-5.1"), null);
+  assert.strictEqual(resolveModel("unknown-model"), null);
 }
 
 function testNormalizeMaxTokens() {
