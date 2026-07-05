@@ -1,15 +1,12 @@
 # SZTU API Proxy
 
-Local compatibility proxies for SZTU `glm-5.1` and `deepseek-v4-pro`.
+Local compatibility proxies for SZTU `deepseek-v4-pro`.
 
-This repository only contains proxy code. Client configuration files such as
-OpenCode `opencode.json` or CodeBuddy `model.json` can be copied into each
-subdirectory by the user.
+Official API reference: [docs/DeepSeek-V4-Pro_API_v1.0.md](docs/DeepSeek-V4-Pro_API_v1.0.md)
 
-## Claude Code (No Longer Supported)
+Trial notes: [docs/implementation-notes.md](docs/implementation-notes.md)
 
-The Claude Code proxy has been removed. This project no longer supports Claude Code.
-Use OpenCode or CodeBuddy instead.
+Historical GLM / Claude Code: [docs/archived.md](docs/archived.md)
 
 ## Environment
 
@@ -22,21 +19,14 @@ SZTU_API_KEY=your_key_here
 Optional:
 
 ```env
-SZTU_DEFAULT_MODEL=glm-5.1
+SZTU_DEFAULT_MODEL=deepseek-v4-pro
 OPENCODE_PROXY_PORT=8788
 CODEBUDDY_PROXY_PORT=8787
-SZTU_DEFAULT_MAX_TOKENS=32768
+SZTU_DEFAULT_MAX_TOKENS=8192
 SZTU_MAX_TOKENS=32768
-SZTU_THINKING_MIN_MAX_TOKENS=10000
 ```
 
 ## Proxies
-
-OpenCode:
-
-```powershell
-node .\opencode\opencode-proxy.js
-```
 
 CodeBuddy:
 
@@ -44,27 +34,20 @@ CodeBuddy:
 node .\codebuddy\codebuddy-proxy.js
 ```
 
+OpenCode:
+
+```powershell
+node .\opencode\opencode-proxy.js
+```
+
 Runtime logs and PID files are written under each proxy's `.runtime` folder.
 
 ## Tests
 
-Run direct SZTU API checks:
-
 ```powershell
 node .\scripts\test-api.js direct
-```
-
-Run proxy checks after starting the matching proxy:
-
-```powershell
-node .\scripts\test-api.js opencode
 node .\scripts\test-api.js codebuddy
-```
-
-Run everything:
-
-```powershell
-node .\scripts\test-api.js all
+node .\scripts\test-codebuddy-proxy.js
 ```
 
 See [scripts/README.md](scripts/README.md) for the full test matrix.

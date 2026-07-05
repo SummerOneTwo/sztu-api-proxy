@@ -1,24 +1,12 @@
 {
     "models": [
         {
-            "id": "glm-5.1",
-            "name": "glm-5.1",
-            "vendor": "SZTU",
-            "apiKey": "any",
-            "maxInputTokens": 65536,
-            "maxOutputTokens": 8192,
-            "url": "http://127.0.0.1:8787/v1/chat/completions",
-            "supportsToolCall": true,
-            "supportsImages": false,
-            "supportsReasoning": true
-        },
-        {
             "id": "deepseek-v4-pro",
-            "name": "deepseek-v4-pro",
+            "name": "DeepSeek V4 Pro (high)",
             "vendor": "SZTU",
             "apiKey": "any",
-            "maxInputTokens": 65536,
-            "maxOutputTokens": 8192,
+            "maxInputTokens": 131072,
+            "maxOutputTokens": 32768,
             "url": "http://127.0.0.1:8787/v1/chat/completions",
             "supportsToolCall": true,
             "supportsImages": false,
@@ -26,15 +14,27 @@
         },
         {
             "id": "deepseek-v4-pro-instruct",
-            "name": "deepseek-v4-pro-instruct",
+            "name": "DeepSeek V4 Pro (instruct)",
             "vendor": "SZTU",
             "apiKey": "any",
-            "maxInputTokens": 65536,
-            "maxOutputTokens": 8192,
+            "maxInputTokens": 131072,
+            "maxOutputTokens": 32768,
             "url": "http://127.0.0.1:8787/v1/chat/completions",
             "supportsToolCall": true,
             "supportsImages": false,
             "supportsReasoning": false
+        },
+        {
+            "id": "deepseek-v4-pro-max",
+            "name": "DeepSeek V4 Pro (max)",
+            "vendor": "SZTU",
+            "apiKey": "any",
+            "maxInputTokens": 131072,
+            "maxOutputTokens": 32768,
+            "url": "http://127.0.0.1:8787/v1/chat/completions",
+            "supportsToolCall": true,
+            "supportsImages": false,
+            "supportsReasoning": true
         }
     ]
 }

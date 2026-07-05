@@ -11,8 +11,15 @@ const TARGET_PATH = "/v1/chat/completions";
 const LOG_DIR = path.join(__dirname, ".runtime");
 const LOG_PATH = path.join(LOG_DIR, "codebuddy-proxy.log");
 const PID_PATH = path.join(LOG_DIR, "codebuddy-proxy.pid");
-const SZTU_DEFAULT_MAX_TOKENS = envNumber("SZTU_DEFAULT_MAX_TOKENS", 16384);
+const SZTU_DEFAULT_MAX_TOKENS = envNumber("SZTU_DEFAULT_MAX_TOKENS", 8192);
 const SZTU_MAX_TOKENS = envNumber("SZTU_MAX_TOKENS", 32768);
+const DSV4_API_MODEL = "deepseek-v4-pro";
+const DSV4_MAX_TIER_FLOOR = 4000;
+const CLIENT_MODELS = [
+  "deepseek-v4-pro",
+  "deepseek-v4-pro-instruct",
+  "deepseek-v4-pro-max",
+];
 
 fs.mkdirSync(LOG_DIR, { recursive: true });
 
@@ -30,12 +37,18 @@ function cleanupAndExit(signal) {
   process.exit(0);
 }
 
-function normalizeMaxTokens(value) {
+function normalizeMaxTokens(value, tier) {
   const n = Number(value);
+  let result;
   if (!Number.isFinite(n) || n <= 0) {
-    return Math.min(SZTU_DEFAULT_MAX_TOKENS, SZTU_MAX_TOKENS);
+    result = Math.min(SZTU_DEFAULT_MAX_TOKENS, SZTU_MAX_TOKENS);
+  } else {
+    result = Math.min(Math.trunc(n), SZTU_MAX_TOKENS);
   }
-  return Math.min(Math.trunc(n), SZTU_DEFAULT_MAX_TOKENS, SZTU_MAX_TOKENS);
+  if (tier === "max" && result < DSV4_MAX_TIER_FLOOR) {
+    result = DSV4_MAX_TIER_FLOOR;
+  }
+  return result;
 }
 
 const DSV4_INSTRUCT_ALIASES = new Set([
@@ -43,33 +56,68 @@ const DSV4_INSTRUCT_ALIASES = new Set([
   "deepseek-v4-pro-nothink",
 ]);
 
+function parseClientModelId(value) {
+  const raw = typeof value === "string" ? value.trim() : "";
+  if (!raw) {
+    return "";
+  }
+  const normalized = raw.split(":").pop().trim();
+  if (normalized.startsWith("deepseek-v4-pro")) {
+    return normalized;
+  }
+  return normalized.split("/").pop().trim();
+}
+
 function resolveModel(value) {
-  const raw = typeof value === "string" ? value : "";
-  const model = raw.split(":").pop().split("/").pop();
+  const model = parseClientModelId(value);
   if (DSV4_INSTRUCT_ALIASES.has(model)) {
-    return { apiModel: "deepseek-v4-pro", thinking: false };
+    return {
+      clientModel: "deepseek-v4-pro-instruct",
+      apiModel: DSV4_API_MODEL,
+      thinking: false,
+      tier: "instruct",
+    };
+  }
+  if (model === "deepseek-v4-pro-max") {
+    return {
+      clientModel: "deepseek-v4-pro-max",
+      apiModel: DSV4_API_MODEL,
+      thinking: true,
+      reasoningEffort: "max",
+      tier: "max",
+    };
   }
   if (model === "deepseek-v4-pro") {
-    return { apiModel: "deepseek-v4-pro", thinking: true };
+    return {
+      clientModel: "deepseek-v4-pro",
+      apiModel: DSV4_API_MODEL,
+      thinking: true,
+      reasoningEffort: "high",
+      tier: "high",
+    };
   }
-  return { apiModel: "glm-5.1", thinking: false };
+  return null;
 }
 
 function normalizeModel(value) {
-  return resolveModel(value).apiModel;
+  const resolved = resolveModel(value);
+  return resolved ? resolved.apiModel : DSV4_API_MODEL;
 }
 
 function sanitizeBody(body) {
   const next = { ...body };
   const resolved = resolveModel(next.model);
+  if (!resolved) {
+    const error = new Error(`unsupported model: ${next.model}`);
+    error.code = "UNSUPPORTED_MODEL";
+    throw error;
+  }
   next.model = resolved.apiModel;
 
-  const requestedMaxTokens = normalizeMaxTokens(
-    next.max_tokens ?? next.max_completion_tokens ?? next.max_output_tokens
+  next.max_tokens = normalizeMaxTokens(
+    next.max_tokens ?? next.max_completion_tokens ?? next.max_output_tokens,
+    resolved.tier
   );
-  if (requestedMaxTokens !== undefined) {
-    next.max_tokens = requestedMaxTokens;
-  }
   delete next.max_completion_tokens;
   delete next.max_output_tokens;
 
@@ -91,24 +139,16 @@ function sanitizeBody(body) {
   const template = next.chat_template_kwargs && typeof next.chat_template_kwargs === "object"
     ? next.chat_template_kwargs
     : {};
-  if (next.model === "deepseek-v4-pro") {
-    if (resolved.thinking) {
-      next.chat_template_kwargs = {
-        ...template,
-        thinking: true,
-        reasoning_effort: "max",
-      };
-    } else {
-      // Same default as CK-Bench L2/L3 judge: faster, no reasoning tokens.
-      next.chat_template_kwargs = {
-        ...template,
-        thinking: false,
-      };
-    }
+  if (resolved.thinking) {
+    next.chat_template_kwargs = {
+      ...template,
+      thinking: true,
+      reasoning_effort: resolved.reasoningEffort,
+    };
   } else {
     next.chat_template_kwargs = {
-      enable_thinking: false,
       ...template,
+      thinking: false,
     };
   }
 
@@ -130,7 +170,7 @@ function sanitizeBody(body) {
           const text = flattenContent(message.content) || String(message.content || "");
           clean.content = `Tool result${message.tool_call_id ? ` for ${message.tool_call_id}` : ""}:\n${text}`;
           return clean;
-        } else if (Array.isArray(message?.tool_calls)) {
+        } else if (Array.isArray(message?.tool_calls) && message.tool_calls.length > 0) {
           // The SZTU endpoint can return tool calls, but rejects tool_calls in
           // historical assistant messages. Dropping those records is safer than
           // turning them into natural language that the model may later imitate.
@@ -564,23 +604,19 @@ const server = http.createServer((req, res) => {
   if (req.method === "GET" && pathName === "/health") {
     writeJson(res, 200, {
       ok: true,
-      models: ["glm-5.1", "deepseek-v4-pro", "deepseek-v4-pro-instruct"],
+      models: CLIENT_MODELS,
     });
     return;
   }
   if (req.method === "GET" && pathName === "/v1/models") {
     writeJson(res, 200, {
       object: "list",
-      data: [
-        { id: "glm-5.1", object: "model", created: 0, owned_by: "sztu" },
-        { id: "deepseek-v4-pro", object: "model", created: 0, owned_by: "sztu" },
-        {
-          id: "deepseek-v4-pro-instruct",
-          object: "model",
-          created: 0,
-          owned_by: "sztu",
-        },
-      ],
+      data: CLIENT_MODELS.map((id) => ({
+        id,
+        object: "model",
+        created: 0,
+        owned_by: "sztu",
+      })),
     });
     return;
   }
@@ -605,7 +641,17 @@ const server = http.createServer((req, res) => {
     }
 
     const isResponsesApi = pathName === "/v1/responses";
-    const nextBody = isResponsesApi ? responsesToChatCompletions(body) : sanitizeBody(body);
+    let nextBody;
+    try {
+      nextBody = isResponsesApi ? responsesToChatCompletions(body) : sanitizeBody(body);
+    } catch (error) {
+      if (error && error.code === "UNSUPPORTED_MODEL") {
+        log("unsupported-model", { requestId, model: body?.model });
+        writeJson(res, 400, { error: error.message });
+        return;
+      }
+      throw error;
+    }
     const wantsStream = nextBody.stream === true;
     const upstreamBody = nextBody;
     const apiKey = getApiKey();
@@ -720,11 +766,12 @@ if (require.main === module) {
 }
 
 module.exports = {
+  CLIENT_MODELS,
   chatCompletionsToResponses,
   emitResponsesStreamFromChatStream,
-  normalizeBody: sanitizeBody,
   normalizeMaxTokens,
   normalizeModel,
+  resolveModel,
   responsesToChatCompletions,
   sanitizeBody,
   startServer,

@@ -8,6 +8,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Each change set is recorded under a new version immediately. There is no
 `[Unreleased]` section or separate release step.
 
+## [0.2.3] - 2026-07-05
+
+### Changed
+
+- CodeBuddy proxy is DeepSeek-only with three client model ids:
+  `deepseek-v4-pro` (high), `deepseek-v4-pro-instruct`, and `deepseek-v4-pro-max`.
+- `deepseek-v4-pro` now maps to `reasoning_effort: "high"` instead of `"max"`.
+- Unknown models return 400 instead of falling back to GLM.
+- `normalizeMaxTokens` uses DEFAULT when omitted and caps explicit requests at MAX only.
+- `deepseek-v4-pro-max` enforces a 4000 `max_tokens` floor per official Think Max guidance.
+- `implementation-notes.md` keeps DeepSeek/CodeBuddy/OpenCode trial notes; GLM/CC moved to `archived.md`.
+
+### Fixed
+
+- Assistant messages with empty `tool_calls: []` are no longer dropped from history.
+
+### Added
+
+- `docs/archived.md` for GLM / Claude Code trial notes only.
+- `scripts/test-codebuddy-proxy.js` unit tests for model tiers and sanitization.
+
+### Removed
+
+- GLM entries from CodeBuddy `models.json`, health, and `/v1/models`.
+
 ## [0.2.2] - 2026-07-05
 
 ### Removed

@@ -2,25 +2,27 @@
 
 ## Supported Models
 
-The CodeBuddy proxy supports both SZTU models:
+Three client model ids route to upstream `deepseek-v4-pro`:
 
-- `glm-5.1`
-- `deepseek-v4-pro`
-- `deepseek-v4-pro-instruct` (same upstream model, `thinking=false` — matches CK-Bench L2 judge)
+| Model id | `chat_template_kwargs` |
+|----------|------------------------|
+| `deepseek-v4-pro` | `thinking: true`, `reasoning_effort: "high"` |
+| `deepseek-v4-pro-instruct` | `thinking: false` |
+| `deepseek-v4-pro-max` | `thinking: true`, `reasoning_effort: "max"` |
 
-Both models are exposed as local custom models through `models.json` and route
-to:
+Copy `models.json` to `~/.codebuddy/models.json` or `.codebuddy/models.json`.
+The client may use `apiKey: "any"`; the proxy reads the real key from root `.env`.
+
+Endpoint:
 
 ```text
 http://127.0.0.1:8787/v1/chat/completions
 ```
 
-The client config may use `apiKey: "any"`; the proxy reads the real key from the
-repository root `.env`.
+See [../docs/implementation-notes.md](../docs/implementation-notes.md) for trial
+notes. Official parameters: [../docs/DeepSeek-V4-Pro_API_v1.0.md](../docs/DeepSeek-V4-Pro_API_v1.0.md).
 
 ## Runtime
-
-Start the proxy:
 
 ```powershell
 node .\codebuddy\codebuddy-proxy.js
@@ -34,27 +36,16 @@ Invoke-RestMethod http://127.0.0.1:8787/health
 
 ## Notes
 
-- GLM defaults to `chat_template_kwargs.enable_thinking=false` for CodeBuddy
-  traffic. This avoids empty final content when the output budget is spent on
-  reasoning tokens.
-- DeepSeek `deepseek-v4-pro` keeps `thinking=true` / `reasoning_effort=max`.
-- DeepSeek `deepseek-v4-pro-instruct` routes to the same upstream model with
-  `chat_template_kwargs.thinking=false` (CK-Bench agent eval default).
-- `max_completion_tokens` and `max_output_tokens` are normalized to
-  `max_tokens` and clamped by `SZTU_DEFAULT_MAX_TOKENS` / `SZTU_MAX_TOKENS`.
-- Upstream 5xx errors are retried up to 3 attempts before returning the error to
-  CodeBuddy.
+- Pick reasoning tier by **model id** in CodeBuddy (no per-model effort field in `models.json`).
+- `max_completion_tokens` / `max_output_tokens` normalize to `max_tokens`.
+- Missing `max_tokens` defaults to `SZTU_DEFAULT_MAX_TOKENS` (8192); cap at `SZTU_MAX_TOKENS`.
+- `deepseek-v4-pro-max` raises `max_tokens` to at least 4000 per official Think Max guidance.
+- Upstream 5xx errors retry up to 3 times.
+- Tool history: assistant `tool_calls` dropped; `role: tool` converted to user text.
 
-## Verified Smoke Tests
+## Tests
 
-The proxy was verified with direct API calls for:
-
-- GLM non-stream chat
-- GLM stream chat
-- GLM Responses API conversion
-- GLM native tool call
-- GLM tool-result follow-up
-- DeepSeek non-stream chat
-
-It was also verified by running CodeBuddy CLI end-to-end against both models to
-create a small zero-dependency Node.js todo CLI project and run its tests.
+```powershell
+node ..\scripts\test-codebuddy-proxy.js
+node ..\scripts\test-api.js codebuddy
+```

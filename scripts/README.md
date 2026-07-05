@@ -32,8 +32,8 @@ Examples:
 
 ```powershell
 node .\scripts\test-api.js direct
-node .\scripts\test-api.js opencode codebuddy
-node .\scripts\test-api.js all
+node .\scripts\test-api.js codebuddy
+node .\scripts\test-codebuddy-proxy.js
 ```
 
 When a proxy test fails, check the JSONL runtime logs and search by

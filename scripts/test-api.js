@@ -212,11 +212,27 @@ async function testOpenCode() {
 
 async function testCodeBuddy() {
   const ok = [];
-  ok.push(await openAiNonStream("codebuddy proxy chat glm non-stream", CODEBUDDY_CHAT_URL, "glm-5.1", "GLM_OK"));
-  ok.push(await openAiStream("codebuddy proxy chat glm stream usage", CODEBUDDY_CHAT_URL, "glm-5.1", "GLM_STREAM_OK"));
+  ok.push(await openAiNonStream(
+    "codebuddy proxy instruct non-stream",
+    CODEBUDDY_CHAT_URL,
+    "deepseek-v4-pro-instruct",
+    "DS_INSTRUCT_OK"
+  ));
+  ok.push(await openAiStream(
+    "codebuddy proxy high stream usage",
+    CODEBUDDY_CHAT_URL,
+    "deepseek-v4-pro",
+    "DS_HIGH_STREAM_OK"
+  ));
+  ok.push(await openAiNonStream(
+    "codebuddy proxy max non-stream",
+    CODEBUDDY_CHAT_URL,
+    "deepseek-v4-pro-max",
+    "DS_MAX_OK"
+  ));
   ok.push(await testCase("codebuddy proxy responses non-stream", async () => {
     const res = await postJson(CODEBUDDY_RESPONSES_URL, {
-      model: "glm-5.1",
+      model: "deepseek-v4-pro-instruct",
       input: "请只回复 RESP_OK",
       max_output_tokens: 128,
     });
