@@ -8,6 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Each change set is recorded under a new version immediately. There is no
 `[Unreleased]` section or separate release step.
 
+## [0.2.6] - 2026-07-05
+
+### Fixed
+
+- Restored CodeBuddy HTTP envelope handling on the v0.2.5 base: recover JSON
+  from envelope bodies, salvage truncated `messages`, and return **503 retryable
+  JSON** when salvage fails (default; `CODEBUDDY_ENVELOPE_STUB=1` restores the
+  legacy empty SSE stub).
+
+### Added
+
+- `scripts/test-codebuddy-envelope.js` regression tests for envelope salvage and
+  503 retry responses.
+
 ## [0.2.5] - 2026-07-05
 
 ### Changed

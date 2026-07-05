@@ -43,9 +43,31 @@ Invoke-RestMethod http://127.0.0.1:8787/health
 - Tool history: assistant `tool_calls` dropped; `role: tool` converted to user text.
 - JSONL logs under `.runtime/`; entries older than 7 days are pruned automatically.
 
+## CodeBuddy HTTP envelope handling
+
+CodeBuddy CLI may send a full HTTP request envelope as the POST body (headers +
+JSON). The proxy:
+
+- Recovers JSON from envelope bodies (`client-body-envelope-recovered`)
+- Salvages truncated envelopes with partial `messages` (`client-body-envelope-salvaged`)
+- Returns **503 retryable JSON** for header-only / incomplete bodies (default;
+  set `CODEBUDDY_ENVELOPE_STUB=1` to restore the legacy empty SSE stub)
+- Caches per-conversation tools/model/stream via `X-Conversation-ID`
+  (`conversationStateCache`, TTL 2h)
+
+The proxy **does not** change the client-selected model tier, and **does not**
+rewrite model output (no text-to-tool stream salvage).
+
+Regression tests:
+
+```powershell
+node ..\scripts\test-codebuddy-envelope.js
+```
+
 ## Tests
 
 ```powershell
 node ..\scripts\test-codebuddy-proxy.js
+node ..\scripts\test-codebuddy-envelope.js
 node ..\scripts\test-api.js codebuddy
 ```

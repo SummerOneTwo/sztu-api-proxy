@@ -224,6 +224,37 @@ Runtime logs:
 codebuddy/.runtime/codebuddy-proxy.log
 ```
 
+### HTTP envelope (CodeBuddy CLI)
+
+CodeBuddy may POST a full HTTP envelope instead of raw JSON. Symptoms without
+envelope handling:
+
+```text
+400 {"error":"invalid json"}
+Unexpected token 'P', "POST http:"... is not valid JSON
+```
+
+Proxy behavior (v0.2.6+):
+
+```text
+client-body-envelope-recovered   JSON extracted after header block
+client-body-envelope-salvaged    truncated body rebuilt (tools from body/cache)
+envelope-retry-response          503 + Retry-After when salvage fails
+invalid-json                     still logged for non-envelope bad JSON
+```
+
+Env:
+
+```text
+CODEBUDDY_ENVELOPE_STUB=0        default; 503 retry instead of empty SSE stub
+```
+
+Tests:
+
+```powershell
+node .\scripts\test-codebuddy-envelope.js
+```
+
 ## Security and Open Source Hygiene
 
 Do:

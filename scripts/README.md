@@ -34,6 +34,7 @@ Examples:
 node .\scripts\test-api.js direct
 node .\scripts\test-api.js codebuddy
 node .\scripts\test-codebuddy-proxy.js
+node .\scripts\test-codebuddy-envelope.js
 ```
 
 When a proxy test fails, check the JSONL runtime logs and search by

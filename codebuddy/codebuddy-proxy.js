@@ -21,9 +21,19 @@ const CLIENT_MODELS = [
   "deepseek-v4-pro-max",
 ];
 
+const CODEBUDDY_ENVELOPE_STUB = String(process.env.CODEBUDDY_ENVELOPE_STUB || "0").trim() === "1";
+
 fs.mkdirSync(LOG_DIR, { recursive: true });
 
 const log = createLogger("codebuddy", LOG_PATH);
+
+function preview(value, maxLen = 1000) {
+  const text = typeof value === "string" ? value : JSON.stringify(value);
+  if (text.length <= maxLen) {
+    return text;
+  }
+  return `${text.slice(0, maxLen)}…`;
+}
 
 function cleanupAndExit(signal) {
   log("shutdown", { signal });
@@ -319,6 +329,578 @@ async function requestUpstreamWithRetry(payload, apiKey, wantsStream, requestId,
   throw lastError;
 }
 
+function extractBalancedJson(text, startIdx) {
+  if (startIdx < 0 || startIdx >= text.length) {
+    return "";
+  }
+  const open = text[startIdx];
+  if (open !== "{" && open !== "[") {
+    return "";
+  }
+  const close = open === "{" ? "}" : "]";
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  for (let i = startIdx; i < text.length; i += 1) {
+    const ch = text[i];
+    if (inString) {
+      if (escape) {
+        escape = false;
+      } else if (ch === "\\") {
+        escape = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+    if (ch === open) {
+      depth += 1;
+    } else if (ch === close) {
+      depth -= 1;
+      if (depth === 0) {
+        return text.slice(startIdx, i + 1);
+      }
+    }
+  }
+  return "";
+}
+
+function findJsonStart(text) {
+  const markers = ['{"model"', '{"messages"', '{"input"', '{"stream"'];
+  let best = -1;
+  for (const marker of markers) {
+    const idx = text.indexOf(marker);
+    if (idx >= 0 && (best < 0 || idx < best)) {
+      best = idx;
+    }
+  }
+  if (best >= 0) {
+    return best;
+  }
+  return text.indexOf("{");
+}
+
+function extractJsonPayload(raw) {
+  const text = typeof raw === "string" ? raw : "";
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return "";
+  }
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+    return trimmed;
+  }
+  if (!/^(POST|GET|PUT|PATCH|DELETE) /i.test(trimmed)) {
+    return trimmed;
+  }
+
+  for (const sep of ["\r\n\r\n", "\n\n"]) {
+    const idx = text.indexOf(sep);
+    if (idx < 0) {
+      continue;
+    }
+    const jsonPart = text.slice(idx + sep.length).trim();
+    const start = findJsonStart(jsonPart);
+    if (start >= 0) {
+      const balanced = extractBalancedJson(jsonPart, start);
+      if (balanced) {
+        return balanced;
+      }
+    }
+  }
+
+  const start = findJsonStart(text);
+  if (start >= 0) {
+    const balanced = extractBalancedJson(text, start);
+    if (balanced) {
+      return balanced;
+    }
+  }
+
+  return "";
+}
+
+function findEnvelopeBodyStart(raw) {
+  for (const sep of ["\r\n\r\n", "\n\n"]) {
+    const idx = raw.indexOf(sep);
+    if (idx >= 0) {
+      return idx + sep.length;
+    }
+  }
+  return -1;
+}
+
+const CONVERSATION_STATE_TTL_MS = 2 * 60 * 60 * 1000;
+const CONVERSATION_STATE_MAX_ENTRIES = 500;
+const conversationStateCache = new Map();
+
+function parseConversationId(raw, headers = {}) {
+  const headerId = headers["x-conversation-id"] || headers["X-Conversation-ID"];
+  if (headerId && String(headerId).trim()) {
+    return String(headerId).trim();
+  }
+  const text = typeof raw === "string" ? raw : "";
+  const match = text.match(/X-Conversation-ID:\s*([^\s\r\n]+)/i);
+  return match ? match[1].trim() : "";
+}
+
+function pruneConversationStateCache(now = Date.now()) {
+  for (const [key, entry] of conversationStateCache) {
+    if (now - entry.ts > CONVERSATION_STATE_TTL_MS) {
+      conversationStateCache.delete(key);
+    }
+  }
+  if (conversationStateCache.size <= CONVERSATION_STATE_MAX_ENTRIES) {
+    return;
+  }
+  const overflow = conversationStateCache.size - CONVERSATION_STATE_MAX_ENTRIES;
+  const keys = [...conversationStateCache.entries()]
+    .sort((a, b) => a[1].ts - b[1].ts)
+    .slice(0, overflow)
+    .map(([key]) => key);
+  for (const key of keys) {
+    conversationStateCache.delete(key);
+  }
+}
+
+function cacheConversationState(conversationId, body) {
+  if (!conversationId || !body || typeof body !== "object") {
+    return;
+  }
+  const messages = Array.isArray(body.messages) ? body.messages : [];
+  const tools = Array.isArray(body.tools) && body.tools.length > 0 ? body.tools : null;
+  const previous = getCachedConversationState(conversationId);
+  if (!tools && messages.length === 0 && !previous) {
+    return;
+  }
+  const now = Date.now();
+  conversationStateCache.set(conversationId, {
+    tools: tools || previous?.tools || null,
+    model: body.model ?? previous?.model,
+    stream: body.stream === true ? true : (body.stream === false ? false : previous?.stream),
+    max_tokens: body.max_tokens ?? previous?.max_tokens,
+    messageCount: messages.length || previous?.messageCount || 0,
+    contentChars: messages.length ? estimateMessagesChars(messages) : (previous?.contentChars || 0),
+    ts: now,
+  });
+  pruneConversationStateCache(now);
+}
+
+function getCachedConversationState(conversationId) {
+  if (!conversationId) {
+    return null;
+  }
+  const entry = conversationStateCache.get(conversationId);
+  if (!entry) {
+    return null;
+  }
+  if (Date.now() - entry.ts > CONVERSATION_STATE_TTL_MS) {
+    conversationStateCache.delete(conversationId);
+    return null;
+  }
+  return entry;
+}
+
+function cacheConversationTools(conversationId, tools) {
+  cacheConversationState(conversationId, { tools, messages: [] });
+}
+
+function getCachedConversationTools(conversationId) {
+  const state = getCachedConversationState(conversationId);
+  return state?.tools || null;
+}
+
+function parseEnvelopeHeaders(raw) {
+  const bodyStart = findEnvelopeBodyStart(raw);
+  const headerPart = bodyStart >= 0 ? raw.slice(0, bodyStart) : raw;
+  const match = headerPart.match(/Content-Length:\s*(\d+)/i);
+  const declaredContentLength = match ? Number(match[1]) : 0;
+  const actualBodyBytes = bodyStart >= 0 ? Buffer.byteLength(raw.slice(bodyStart), "utf8") : 0;
+  const totalBytes = Buffer.byteLength(raw || "", "utf8");
+  const incomplete = declaredContentLength > 0 && actualBodyBytes < declaredContentLength;
+  return {
+    declaredContentLength,
+    actualBodyBytes,
+    totalBytes,
+    incomplete,
+  };
+}
+
+function extractModelFromJsonPart(jsonPart) {
+  const match = jsonPart.match(/"model"\s*:\s*"([^"]+)"/);
+  return match ? match[1] : null;
+}
+
+function findLastCompleteMessageEnd(jsonPart, bracket) {
+  if (bracket < 0 || bracket >= jsonPart.length || jsonPart[bracket] !== "[") {
+    return -1;
+  }
+
+  let depth = 1;
+  let inString = false;
+  let escape = false;
+  let lastMessageEnd = -1;
+
+  for (let i = bracket + 1; i < jsonPart.length; i += 1) {
+    const ch = jsonPart[i];
+    if (inString) {
+      if (escape) {
+        escape = false;
+      } else if (ch === "\\") {
+        escape = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+    if (ch === "{" || ch === "[") {
+      depth += 1;
+    } else if (ch === "}" || ch === "]") {
+      depth -= 1;
+      if (ch === "}" && depth === 1) {
+        lastMessageEnd = i;
+      }
+    }
+  }
+
+  return lastMessageEnd;
+}
+
+function extractToolsFromJsonPart(jsonPart) {
+  const messagesKey = jsonPart.indexOf('"messages":');
+  if (messagesKey < 0) {
+    return null;
+  }
+  const bracket = jsonPart.indexOf("[", messagesKey);
+  if (bracket < 0) {
+    return null;
+  }
+
+  const toolsMarkers = ['],"tools":', '],\n"tools":', '],\r\n"tools":'];
+  let toolsKey = -1;
+  for (const marker of toolsMarkers) {
+    const idx = jsonPart.indexOf(marker, bracket);
+    if (idx >= 0 && (toolsKey < 0 || idx < toolsKey)) {
+      toolsKey = idx + marker.indexOf('"tools":');
+    }
+  }
+  if (toolsKey < 0) {
+    toolsKey = jsonPart.indexOf('"tools":', bracket);
+  }
+  if (toolsKey < 0) {
+    return null;
+  }
+
+  const arrayStart = jsonPart.indexOf("[", toolsKey);
+  if (arrayStart < 0) {
+    return null;
+  }
+  const balanced = extractBalancedJson(jsonPart, arrayStart);
+  if (!balanced) {
+    return null;
+  }
+  try {
+    const tools = JSON.parse(balanced);
+    return Array.isArray(tools) && tools.length > 0 ? tools : null;
+  } catch (error) {
+    return null;
+  }
+}
+
+function resolveSalvagedTools(jsonPart, conversationId) {
+  const fromBody = extractToolsFromJsonPart(jsonPart);
+  if (fromBody) {
+    return { tools: fromBody, toolsSource: "body", stateFromCache: false };
+  }
+  const fromCache = getCachedConversationTools(conversationId);
+  if (fromCache) {
+    return { tools: fromCache, toolsSource: "cache", stateFromCache: true };
+  }
+  return { tools: null, toolsSource: "none", stateFromCache: false };
+}
+
+function estimateMessagesChars(messages) {
+  if (!Array.isArray(messages)) {
+    return 0;
+  }
+  return messages.reduce((sum, message) => {
+    if (typeof message?.content === "string") {
+      return sum + message.content.length;
+    }
+    if (Array.isArray(message?.content)) {
+      return sum + JSON.stringify(message.content).length;
+    }
+    return sum + JSON.stringify(message || "").length;
+  }, 0);
+}
+
+function trimSalvagedMessages(body, { keepRecent = 6, maxContentChars = 80000 } = {}) {
+  if (!body || !Array.isArray(body.messages) || body.messages.length === 0) {
+    return body;
+  }
+
+  const messages = body.messages;
+  const systemMessages = messages.filter((message) => message?.role === "system");
+  const firstUserIdx = messages.findIndex((message) => message?.role === "user");
+  const firstUser = firstUserIdx >= 0 ? messages[firstUserIdx] : null;
+  const pinned = new Set(systemMessages);
+  if (firstUser) {
+    pinned.add(firstUser);
+  }
+
+  const nonPinned = messages.filter((message, index) => !pinned.has(message) && index !== firstUserIdx);
+  const recent = nonPinned.slice(-keepRecent);
+  const trimmed = [...systemMessages];
+  if (firstUser) {
+    trimmed.push(firstUser);
+  }
+  for (const message of recent) {
+    if (message !== firstUser) {
+      trimmed.push(message);
+    }
+  }
+
+  while (estimateMessagesChars(trimmed) > maxContentChars && trimmed.length > 2) {
+    const removeIdx = trimmed.findIndex(
+      (message, index) => index > 0 && message !== firstUser && message?.role !== "system"
+    );
+    if (removeIdx < 0) {
+      break;
+    }
+    trimmed.splice(removeIdx, 1);
+  }
+
+  return {
+    ...body,
+    messages: trimmed,
+  };
+}
+
+function salvageTruncatedEnvelope(raw, conversationId) {
+  const bodyStart = findEnvelopeBodyStart(raw);
+  if (bodyStart < 0) {
+    return null;
+  }
+  const jsonPart = raw.slice(bodyStart);
+  const arrayKey = jsonPart.indexOf('"messages":');
+  if (arrayKey < 0) {
+    return null;
+  }
+  const bracket = jsonPart.indexOf("[", arrayKey);
+  if (bracket < 0) {
+    return null;
+  }
+
+  const lastMessageEnd = findLastCompleteMessageEnd(jsonPart, bracket);
+  if (lastMessageEnd <= bracket) {
+    return null;
+  }
+
+  // Truncation usually cuts before top-level "stream":true (after messages/tools).
+  // CodeBuddy chat completions expect SSE; default true unless body explicitly says false.
+  const stream = /"stream"\s*:\s*false/.test(jsonPart)
+    ? false
+    : true;
+  const cachedState = getCachedConversationState(conversationId);
+  const salvagedMaxTokens = cachedState?.max_tokens || 8192;
+  const { tools, toolsSource, stateFromCache } = resolveSalvagedTools(jsonPart, conversationId);
+  let suffix = `],"stream":${stream},"max_tokens":${salvagedMaxTokens},"temperature":1`;
+  if (stream) {
+    suffix += ',"stream_options":{"include_usage":true}';
+  }
+  if (tools) {
+    suffix += `,"tools":${JSON.stringify(tools)}`;
+  }
+  suffix += "}";
+
+  const candidate = `${jsonPart.slice(0, lastMessageEnd + 1)}${suffix}`;
+  try {
+    const body = JSON.parse(candidate);
+    if (!Array.isArray(body.messages) || body.messages.length === 0) {
+      return null;
+    }
+    const trimmed = trimSalvagedMessages(body);
+    if (tools) {
+      cacheConversationTools(conversationId, tools);
+    }
+    cacheConversationState(conversationId, trimmed);
+    return {
+      body: trimmed,
+      meta: {
+        toolsSource,
+        stateFromCache,
+        salvagedModel: extractModelFromJsonPart(jsonPart) || cachedState?.model || null,
+        toolsCount: Array.isArray(trimmed.tools) ? trimmed.tools.length : 0,
+        messagesBefore: body.messages.length,
+        messagesAfter: trimmed.messages.length,
+        contentChars: estimateMessagesChars(trimmed.messages),
+      },
+    };
+  } catch (error) {
+    return null;
+  }
+}
+
+function logSalvagedEnvelope(requestId, raw, salvagedResult, reason) {
+  const { body, meta } = salvagedResult;
+  log("client-body-envelope-salvaged", {
+    requestId,
+    rawBytes: Buffer.byteLength(raw || "", "utf8"),
+    messages: body.messages?.length ?? 0,
+    reason,
+    ...meta,
+  });
+}
+
+function parseClientBody(raw, requestId, headers = {}) {
+  const conversationId = parseConversationId(raw, headers);
+  const envelopeMetrics = parseEnvelopeHeaders(raw);
+
+  const applySalvage = (reason) => {
+    const salvagedResult = salvageTruncatedEnvelope(raw, conversationId);
+    if (!salvagedResult) {
+      return null;
+    }
+    logSalvagedEnvelope(requestId, raw, salvagedResult, reason);
+    return salvagedResult.body;
+  };
+
+  let jsonText = extractJsonPayload(raw);
+  if (!jsonText) {
+    const salvageReason = envelopeMetrics.incomplete ? "incomplete_content_length" : "missing_json";
+    const salvaged = applySalvage(salvageReason);
+    if (salvaged) {
+      return salvaged;
+    }
+    const error = new Error("http_envelope_without_json_body");
+    error.envelopeReason = salvageReason;
+    error.envelopeMetrics = envelopeMetrics;
+    log("invalid-json", {
+      requestId,
+      error,
+      bodyPreview: preview(raw, 1000),
+      bodyBytes: envelopeMetrics.totalBytes,
+      declaredContentLength: envelopeMetrics.declaredContentLength,
+      actualBodyBytes: envelopeMetrics.actualBodyBytes,
+      conversationId,
+    });
+    throw error;
+  }
+
+  if (jsonText !== raw.trim()) {
+    log("client-body-envelope-recovered", {
+      requestId,
+      rawBytes: envelopeMetrics.totalBytes,
+      jsonBytes: Buffer.byteLength(jsonText, "utf8"),
+      declaredContentLength: envelopeMetrics.declaredContentLength,
+      actualBodyBytes: envelopeMetrics.actualBodyBytes,
+    });
+  }
+
+  if (envelopeMetrics.incomplete) {
+    const salvaged = applySalvage("incomplete_content_length");
+    if (salvaged) {
+      return salvaged;
+    }
+  }
+
+  try {
+    const body = JSON.parse(jsonText);
+    cacheConversationState(conversationId, body);
+    return body;
+  } catch (error) {
+    if (error instanceof SyntaxError) {
+      const salvaged = applySalvage(envelopeMetrics.incomplete ? "incomplete_content_length" : "syntax_error");
+      if (salvaged) {
+        return salvaged;
+      }
+    }
+    throw error;
+  }
+}
+
+function isCodebuddyHttpEnvelope(raw) {
+  const text = typeof raw === "string" ? raw.trim() : "";
+  return /^POST\s+\S+/i.test(text) && /x-codebuddy-request:\s*1/i.test(text);
+}
+
+function sendEnvelopeRetryResponse(res, requestId, startedAt, meta = {}) {
+  const payload = {
+    error: {
+      type: "incomplete_envelope",
+      message: "CodeBuddy HTTP envelope missing or truncated JSON body",
+      retryable: true,
+      reason: meta.reason || "missing_json_body",
+    },
+  };
+  const data = JSON.stringify(payload);
+  res.writeHead(503, {
+    "Content-Type": "application/json; charset=utf-8",
+    "Content-Length": Buffer.byteLength(data),
+    "Retry-After": "1",
+  });
+  res.end(data);
+  log("envelope-retry-response", {
+    requestId,
+    ...meta,
+    durationMs: durationMs(startedAt),
+  });
+}
+
+function sendCodebuddyEnvelopeStub(res, requestId, startedAt) {
+  const completionId = `cb_stub_${requestId}`;
+  const created = Math.floor(Date.now() / 1000);
+  const streamChunks = [
+    {
+      id: completionId,
+      object: "chat.completion.chunk",
+      created,
+      model: "deepseek-v4-pro",
+      choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }],
+    },
+    {
+      id: completionId,
+      object: "chat.completion.chunk",
+      created,
+      model: "deepseek-v4-pro",
+      choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+      usage: {
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        total_tokens: 0,
+      },
+    },
+  ];
+
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream; charset=utf-8",
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive",
+  });
+
+  let bytes = 0;
+  for (const chunk of streamChunks) {
+    const line = `data: ${JSON.stringify(chunk)}\n\n`;
+    bytes += Buffer.byteLength(line);
+    res.write(line);
+  }
+  const done = "data: [DONE]\n\n";
+  bytes += Buffer.byteLength(done);
+  res.end(done);
+  log("envelope-stub-response", {
+    requestId,
+    bytes,
+    durationMs: durationMs(startedAt),
+  });
+}
+
 function writeJson(res, status, payload) {
   const data = JSON.stringify(payload);
   res.writeHead(status, {
@@ -364,9 +946,38 @@ const server = http.createServer((req, res) => {
     let body;
 
     try {
-      body = JSON.parse(raw);
+      body = parseClientBody(raw, requestId, req.headers);
     } catch (error) {
-      log("invalid-json", { requestId, error, body: raw });
+      const envelope = isCodebuddyHttpEnvelope(raw);
+      const envelopeMetrics = error?.envelopeMetrics || parseEnvelopeHeaders(raw);
+      const conversationId = parseConversationId(raw, req.headers);
+      if (
+        envelope
+        && (error instanceof SyntaxError || error?.message === "http_envelope_without_json_body")
+      ) {
+        if (CODEBUDDY_ENVELOPE_STUB) {
+          sendCodebuddyEnvelopeStub(res, requestId, startedAt);
+        } else {
+          sendEnvelopeRetryResponse(res, requestId, startedAt, {
+            conversationId,
+            reason: error?.envelopeReason || "missing_json_body",
+            bodyBytes: envelopeMetrics.totalBytes,
+            declaredContentLength: envelopeMetrics.declaredContentLength,
+            actualBodyBytes: envelopeMetrics.actualBodyBytes,
+          });
+        }
+        return;
+      }
+      if (error instanceof SyntaxError) {
+        log("invalid-json", { requestId, error, bodyPreview: preview(raw, 1000) });
+        writeJson(res, 400, { error: "invalid json" });
+        return;
+      }
+      if (error && error.message === "http_envelope_without_json_body") {
+        writeJson(res, 400, { error: "malformed http envelope" });
+        return;
+      }
+      log("invalid-json", { requestId, error, bodyPreview: preview(raw, 1000) });
       writeJson(res, 400, { error: "invalid json" });
       return;
     }
@@ -485,6 +1096,11 @@ if (require.main === module) {
 
 module.exports = {
   CLIENT_MODELS,
+  parseClientBody,
+  parseEnvelopeHeaders,
+  salvageTruncatedEnvelope,
+  isCodebuddyHttpEnvelope,
+  sendEnvelopeRetryResponse,
   normalizeMaxTokens,
   normalizeModel,
   resolveModel,
